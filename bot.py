@@ -38,8 +38,9 @@ LEVELS = {
 
 REMINDERS = [
     (9, 0, 'morning'),
+    (10, 30, 'mini'),
     (12, 0, 'training'),
-    (15, 0, 'training'),
+    (14, 30, 'gap'),
     (18, 0, 'training'),
     (21, 0, 'official'),
 ]
@@ -605,8 +606,13 @@ async def handle_choice_answer(user_id, selected, context, chat_id, query):
         pass
 
     if correct:
-        await context.bot.send_message(chat_id, f'✅ Правильно! <b>{options[correct_index]}</b>',
-                                       parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            chat_id,
+            f'✅ Правильно!\n'
+            f'<b>{w["word"].upper()}</b> 🔊 {w["transcription"]} · {w["translation"]}\n\n'
+            f'▸ <i>{w["example1"]}</i>',
+            parse_mode=ParseMode.HTML
+        )
     else:
         await context.bot.send_message(
             chat_id,
@@ -647,7 +653,13 @@ async def handle_type_answer(user_id, text, context, chat_id):
     db.quiz_record(user_id, correct)
 
     if correct:
-        await context.bot.send_message(chat_id, '✅ Правильно!')
+        await context.bot.send_message(
+            chat_id,
+            f'✅ Правильно!\n'
+            f'<b>{w["word"].upper()}</b> 🔊 {w["transcription"]} · {w["translation"]}\n\n'
+            f'▸ <i>{w["example1"]}</i>',
+            parse_mode=ParseMode.HTML
+        )
     else:
         await context.bot.send_message(
             chat_id,
@@ -726,6 +738,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_user(user_id, query.from_user.first_name)
 
     if data == 'noop':
+        return
+
+    # Gap quiz answer
+    if data.startswith('gap:'):
+        parts = data.split(':')
+        # gap:{uid}:{word_id}:{correct_index}:{selected}
+        correct_index = int(parts[3])
+        selected = int(parts[4])
+        word_id = int(parts[2])
+        w = db.get_word_by_id(user_id, word_id)
+        correct = (selected == correct_index)
+        if w:
+            db.record_answer(user_id, w['id'], correct)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if correct:
+            await context.bot.send_message(
+                chat_id,
+                f'✅ Правильно!\n'
+                f'<b>{w["word"].upper()}</b> 🔊 {w["transcription"]} · {w["translation"]}' if w else '✅ Правильно!',
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f'❌ Неправильно. Правильна відповідь: <b>{w["word"].upper()}</b>\n'
+                f'🔊 {w["transcription"]} · {w["translation"]}' if w else '❌ Неправильно.',
+                parse_mode=ParseMode.HTML
+            )
         return
 
     # ----- ONBOARDING level pick -----
@@ -935,6 +978,39 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============ REMINDERS ============
+async def _get_adaptive_words(user_id):
+    """Слабкі та нові слова активної партії, відсортовані за точністю (гірші перші)."""
+    words = db.get_active_batch_words(user_id)
+    if not words:
+        return []
+    scored = []
+    for w in words:
+        total = w['total_answers']
+        acc = (w['correct_answers'] / total) if total else -1  # нові (-1) йдуть першими
+        scored.append((acc, w))
+    scored.sort(key=lambda x: x[0])
+    return [w for _, w in scored]
+
+
+async def start_quiz_words(user_id, kind, word_list, context, chat_id):
+    """Запускає тест по конкретному списку слів."""
+    if not word_list:
+        await context.bot.send_message(chat_id, '📭 Немає слів для тесту.')
+        return False
+    ids = [w['id'] for w in word_list]
+    db.start_quiz(user_id, kind, ids)
+    lvl = db.get_level(user_id) or 3
+    conf = LEVELS[lvl]
+    mode_hint = ('обирай кнопкою' if conf['mode'] == 'choice' else 'пиши вручну')
+    await context.bot.send_message(
+        chat_id,
+        f'🎯 <b>Тренування</b>\n{DIV}\n{len(ids)} слів · {mode_hint} 💪',
+        parse_mode=ParseMode.HTML
+    )
+    await present_question(user_id, context, chat_id)
+    return True
+
+
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     kind = context.job.data
     for u in db.get_all_users():
@@ -948,6 +1024,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             if kind == 'morning':
+                # 9:00 — показати всі слова з транскрипцією і реченнями
                 lines = ['📚 <b>Слова на сьогодні</b>', DIV]
                 for i, w in enumerate(words, 1):
                     lines.append(
@@ -956,10 +1033,29 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                         f'   ▸ <i>{w["example2"]}</i>'
                     )
                 lines.append('')
-                lines.append('Наступне нагадування о 12:00 🕘')
+                lines.append('О 10:30 — міні-тест по цих словах 🎯')
                 await context.bot.send_message(uid, '\n'.join(lines), parse_mode=ParseMode.HTML)
-            elif kind == 'training':
+
+            elif kind == 'mini':
+                # 10:30 — легкий тест по всіх словах з ранку
+                await context.bot.send_message(
+                    uid,
+                    f'🎯 <b>Міні-тест</b>\n{DIV}\nПеревір слова з ранку 👇',
+                    parse_mode=ParseMode.HTML
+                )
                 await start_quiz(uid, 'training', context, uid)
+
+            elif kind == 'training':
+                # 12:00 і 18:00 — адаптивне тренування: слабкі та нові першими
+                adaptive = await _get_adaptive_words(uid)
+                await start_quiz_words(uid, 'training', adaptive, context, uid)
+
+            elif kind == 'gap':
+                # 14:30 — речення з пропуском
+                gap_words = words.copy()
+                random.shuffle(gap_words)
+                await _send_gap_quiz(uid, gap_words, context)
+
             elif kind == 'official':
                 await context.bot.send_message(
                     uid,
@@ -972,6 +1068,50 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             logger.error(f'reminder {kind} for {uid}: {e}')
+
+
+async def _send_gap_quiz(user_id, words, context):
+    """14:30 — речення з пропуском для кожного слова."""
+    lvl = db.get_level(user_id) or 3
+    conf = LEVELS[lvl]
+    nbtn = min(conf['buttons'], 4) if conf['mode'] == 'choice' else 4  # макс 4 кнопки для gap
+
+    lines = [f'✏️ <b>Речення з пропуском</b>\n{DIV}\nВстав правильне слово 👇']
+    await context.bot.send_message(user_id, '\n'.join(lines), parse_mode=ParseMode.HTML)
+
+    for w in words[:min(len(words), 5)]:  # максимум 5 речень
+        # Замінюємо слово в реченні на ___
+        sentence = w['example1']
+        gapped = _make_gap(sentence, w['word'])
+
+        # Варіанти: правильне + дистрактори
+        pool = list(w.get('distractors_en', []) or [])
+        random.shuffle(pool)
+        options = pool[:nbtn - 1] + [w['word']]
+        random.shuffle(options)
+        correct_index = options.index(w['word'])
+
+        rows = [[InlineKeyboardButton(opt, callback_data=f'gap:{user_id}:{w["id"]}:{correct_index}:{i}')]
+                for i, opt in enumerate(options)]
+
+        await context.bot.send_message(
+            user_id,
+            f'🇬🇧 <i>{gapped}</i>\n\n'
+            f'🔊 {w["transcription"]} · {w["translation"]}',
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        await asyncio.sleep(0.3)
+
+
+def _make_gap(sentence, word):
+    """Замінює слово (або його форму) на ___ в реченні."""
+    import re
+    pattern = re.compile(re.escape(word), re.IGNORECASE)
+    result = pattern.sub('___', sentence, count=1)
+    if result == sentence:
+        result = sentence + ' (___)'
+    return result
 
 
 async def post_init(application: Application):
