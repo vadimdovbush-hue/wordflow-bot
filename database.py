@@ -8,7 +8,7 @@ TZ = pytz.timezone('Asia/Ho_Chi_Minh')
 DB_PATH = os.environ.get('DB_PATH', 'wordflow.db')
 
 # Розмір партії за рівнем (рівень також визначає режим тесту в bot.py)
-LEVEL_BATCH = {1: 4, 2: 7, 3: 10, 4: 15}
+LEVEL_BATCH = {1: 4, 2: 8, 3: 12, 4: 15}
 DEFAULT_BATCH = 10
 
 
@@ -42,7 +42,8 @@ class Database:
                     best_streak INTEGER DEFAULT 0,
                     last_active_date TEXT,
                     paused_until TEXT,
-                    official_cooldown TEXT
+                    official_cooldown TEXT,
+                    timezone TEXT DEFAULT 'Asia/Ho_Chi_Minh'
                 );
 
                 CREATE TABLE IF NOT EXISTS words (
@@ -100,6 +101,8 @@ class Database:
             ucols = cols('users')
             if 'level' not in ucols:
                 conn.execute('ALTER TABLE users ADD COLUMN level INTEGER')
+            if 'timezone' not in ucols:
+                conn.execute("ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'Asia/Ho_Chi_Minh'")
 
             wcols = cols('words')
             if 'distractors_en' not in wcols:
@@ -141,6 +144,16 @@ class Database:
     def set_level(self, user_id, level):
         with self._conn() as conn:
             conn.execute('UPDATE users SET level=? WHERE user_id=?', (int(level), user_id))
+
+    def get_timezone(self, user_id):
+        u = self.get_user(user_id)
+        if not u:
+            return 'Asia/Ho_Chi_Minh'
+        return u.get('timezone') or 'Asia/Ho_Chi_Minh'
+
+    def set_timezone(self, user_id, tz):
+        with self._conn() as conn:
+            conn.execute('UPDATE users SET timezone=? WHERE user_id=?', (tz, user_id))
 
     def batch_size_for(self, user_id):
         lvl = self.get_level(user_id) or 3

@@ -31,9 +31,14 @@ LETTERS = 'ABCDEFGH'
 # Рівні складності: розмір партії, к-сть кнопок, режим тесту
 LEVELS = {
     1: {'name': 'Легкий',   'emoji': '🟢', 'batch': 4,  'buttons': 3, 'mode': 'choice', 'desc': '4 слова • вибір з 3'},
-    2: {'name': 'Середній', 'emoji': '🔵', 'batch': 7,  'buttons': 5, 'mode': 'choice', 'desc': '7 слів • вибір з 5'},
-    3: {'name': 'Складний', 'emoji': '🟠', 'batch': 10, 'buttons': 8, 'mode': 'choice', 'desc': '10 слів • вибір з 8'},
+    2: {'name': 'Середній', 'emoji': '🔵', 'batch': 8,  'buttons': 5, 'mode': 'choice', 'desc': '8 слів • вибір з 5'},
+    3: {'name': 'Складний', 'emoji': '🟠', 'batch': 12, 'buttons': 8, 'mode': 'choice', 'desc': '12 слів • вибір з 8'},
     4: {'name': 'Експерт',  'emoji': '🔴', 'batch': 15, 'buttons': 0, 'mode': 'type',   'desc': '15 слів • писати вручну'},
+}
+
+TIMEZONES = {
+    'Asia/Ho_Chi_Minh': '🇻🇳 Хошимін (UTC+7)',
+    'Europe/Kiev': '🇺🇦 Київ (UTC+2/+3)',
 }
 
 REMINDERS = [
@@ -331,7 +336,14 @@ def render_settings(user_id):
     text.append(DIV)
     text.append('⏸ Пауза: ' + ('так, на паузі' if paused else 'вимкнено'))
 
-    rows = [[InlineKeyboardButton('🎚 Змінити рівень', callback_data='s:level')]]
+    tz = db.get_timezone(user_id)
+    tz_label = TIMEZONES.get(tz, tz)
+    text.append(f'🕐 Час нагадувань: {tz_label}')
+
+    rows = [
+        [InlineKeyboardButton('🎚 Змінити рівень', callback_data='s:level')],
+        [InlineKeyboardButton('🕐 Змінити часовий пояс', callback_data='s:tz')],
+    ]
     if paused:
         rows.append([InlineKeyboardButton('▶️ Зняти паузу', callback_data='s:unpause')])
     else:
@@ -355,6 +367,17 @@ def render_level_picker(user_id):
         mark = ' ✅' if n == cur else ''
         rows.append([InlineKeyboardButton(f'{c["emoji"]} {c["name"]} — {c["desc"]}{mark}',
                                           callback_data=f'setlvl:{n}')])
+    rows.append([InlineKeyboardButton('◀️ Назад', callback_data='m:settings')])
+    return '\n'.join(text), InlineKeyboardMarkup(rows)
+
+
+def render_tz_picker(user_id):
+    cur = db.get_timezone(user_id)
+    text = ['🕐 <b>Часовий пояс нагадувань</b>', DIV, '']
+    rows = []
+    for tz, label in TIMEZONES.items():
+        mark = ' ✅' if tz == cur else ''
+        rows.append([InlineKeyboardButton(f'{label}{mark}', callback_data=f'settz:{tz}')])
     rows.append([InlineKeyboardButton('◀️ Назад', callback_data='m:settings')])
     return '\n'.join(text), InlineKeyboardMarkup(rows)
 
@@ -895,6 +918,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f'✅ Рівень: {LEVELS[lvl]["name"]}')
         text, kb = render_settings(user_id)
         return await safe_edit(query, text, kb)
+    if data == 's:tz':
+        text, kb = render_tz_picker(user_id)
+        return await safe_edit(query, text, kb)
+    if data.startswith('settz:'):
+        tz = data.split(':', 1)[1]
+        if tz in TIMEZONES:
+            db.set_timezone(user_id, tz)
+            await query.answer(f'✅ {TIMEZONES[tz]}')
+        text, kb = render_settings(user_id)
+        return await safe_edit(query, text, kb)
     if data.startswith('s:pause:'):
         days = int(data.split(':')[2])
         db.set_pause(user_id, days)
@@ -1012,12 +1045,21 @@ async def start_quiz_words(user_id, kind, word_list, context, chat_id):
 
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    kind = context.job.data
+    job_data = context.job.data
+    kind = job_data['kind']
+    local_hour = job_data['local_hour']
+    local_minute = job_data['local_minute']
+    import pytz as _pytz
     for u in db.get_all_users():
         uid = u['user_id']
         if u.get('level') is None:
             continue
         if db.is_paused(uid):
+            continue
+        # Check: is it the right local time for this user?
+        user_tz = _pytz.timezone(db.get_timezone(uid))
+        user_now = datetime.now(user_tz)
+        if user_now.hour != local_hour or user_now.minute // 30 != local_minute // 30:
             continue
         words = db.get_active_batch_words(uid)
         if not words:
@@ -1033,7 +1075,8 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                         f'   ▸ <i>{w["example2"]}</i>'
                     )
                 lines.append('')
-                lines.append('О 10:30 — міні-тест по цих словах 🎯')
+                tz_label = TIMEZONES.get(db.get_timezone(uid), '')
+                lines.append(f'О 10:30 — міні-тест по цих словах 🎯 ({tz_label})')
                 await context.bot.send_message(uid, '\n'.join(lines), parse_mode=ParseMode.HTML)
 
             elif kind == 'mini':
@@ -1116,10 +1159,27 @@ def _make_gap(sentence, word):
 
 async def post_init(application: Application):
     jq = application.job_queue
-    for h, m, kind in REMINDERS:
-        jq.run_daily(reminder_job, time=time(hour=h, minute=m, tzinfo=TZ), data=kind,
-                     name=f'rem_{h}_{m}')
-    logger.info('Reminders scheduled (Asia/Ho_Chi_Minh)')
+    # Schedule jobs every 30 min — reminder_job checks each user's timezone
+    # Also keep direct slots for all possible reminder times across both zones
+    scheduled = set()
+    import pytz as _pytz
+    for tz_name in TIMEZONES.keys():
+        tz_obj = _pytz.timezone(tz_name)
+        for h, m, kind in REMINDERS:
+            # Convert local time to UTC
+            from datetime import datetime as _dt
+            local_dt = tz_obj.localize(_dt(2000, 1, 1, h, m, 0))
+            utc_dt = local_dt.astimezone(_pytz.utc)
+            key = (utc_dt.hour, utc_dt.minute, kind)
+            if key not in scheduled:
+                scheduled.add(key)
+                jq.run_daily(
+                    reminder_job,
+                    time=time(hour=utc_dt.hour, minute=utc_dt.minute, tzinfo=_pytz.utc),
+                    data={'kind': kind, 'local_hour': h, 'local_minute': m},
+                    name=f'rem_{utc_dt.hour}_{utc_dt.minute}_{kind}'
+                )
+    logger.info(f'Reminders scheduled: {len(scheduled)} slots for {list(TIMEZONES.keys())}')
 
 
 def main():
