@@ -31,8 +31,8 @@ LETTERS = 'ABCDEFGH'
 # Рівні складності: розмір партії, к-сть кнопок, режим тесту
 LEVELS = {
     1: {'name': 'Легкий',   'emoji': '🟢', 'batch': 4,  'buttons': 3, 'mode': 'choice', 'desc': '4 слова • вибір з 3'},
-    2: {'name': 'Середній', 'emoji': '🔵', 'batch': 8,  'buttons': 5, 'mode': 'choice', 'desc': '8 слів • вибір з 5'},
-    3: {'name': 'Складний', 'emoji': '🟠', 'batch': 12, 'buttons': 8, 'mode': 'choice', 'desc': '12 слів • вибір з 8'},
+    2: {'name': 'Середній', 'emoji': '🔵', 'batch': 7,  'buttons': 5, 'mode': 'choice', 'desc': '7 слів • вибір з 5'},
+    3: {'name': 'Складний', 'emoji': '🟠', 'batch': 10, 'buttons': 8, 'mode': 'choice', 'desc': '10 слів • вибір з 8'},
     4: {'name': 'Експерт',  'emoji': '🔴', 'batch': 15, 'buttons': 0, 'mode': 'type',   'desc': '15 слів • писати вручну'},
 }
 

@@ -8,7 +8,7 @@ TZ = pytz.timezone('Asia/Ho_Chi_Minh')
 DB_PATH = os.environ.get('DB_PATH', 'wordflow.db')
 
 # Розмір партії за рівнем (рівень також визначає режим тесту в bot.py)
-LEVEL_BATCH = {1: 4, 2: 8, 3: 12, 4: 15}
+LEVEL_BATCH = {1: 4, 2: 7, 3: 10, 4: 15}
 DEFAULT_BATCH = 10
 
 
