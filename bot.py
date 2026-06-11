@@ -552,7 +552,7 @@ async def present_question(user_id, context, chat_id):
         prompt = payload['prompt']
         rows = []
         for i, opt in enumerate(payload['options']):
-            rows.append([InlineKeyboardButton(f'{LETTERS[i]}  {opt}',
+            rows.append([InlineKeyboardButton(opt,
                                               callback_data=f'qa:{i}')])
         await context.bot.send_message(
             chat_id,
