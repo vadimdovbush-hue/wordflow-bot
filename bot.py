@@ -1,10 +1,14 @@
 import os
 import logging
 import asyncio
+import random
 from datetime import time
 
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -12,7 +16,7 @@ from telegram.ext import (
 )
 
 from database import Database, _now
-from claude_api import get_word_info
+from claude_api import get_word_info, FALLBACK_DISTRACTORS
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -22,8 +26,16 @@ TZ = pytz.timezone('Asia/Ho_Chi_Minh')
 db = Database()
 
 DIV = '━━━━━━━━━━━━━━━━'
+LETTERS = 'ABCDEFGH'
 
-# Reminder schedule (Ho Chi Minh time)
+# Рівні складності: розмір партії, к-сть кнопок, режим тесту
+LEVELS = {
+    1: {'name': 'Легкий',   'emoji': '🟢', 'batch': 4,  'buttons': 3, 'mode': 'choice', 'desc': '4 слова • вибір з 3'},
+    2: {'name': 'Середній', 'emoji': '🔵', 'batch': 7,  'buttons': 5, 'mode': 'choice', 'desc': '7 слів • вибір з 5'},
+    3: {'name': 'Складний', 'emoji': '🟠', 'batch': 10, 'buttons': 8, 'mode': 'choice', 'desc': '10 слів • вибір з 8'},
+    4: {'name': 'Експерт',  'emoji': '🔴', 'batch': 15, 'buttons': 0, 'mode': 'type',   'desc': '15 слів • писати вручну'},
+}
+
 REMINDERS = [
     (9, 0, 'morning'),
     (12, 0, 'training'),
@@ -33,7 +45,49 @@ REMINDERS = [
 ]
 
 
+# ============ LEVENSHTEIN (для режиму «Експерт») ============
+def levenshtein(a, b):
+    a, b = a or '', b or ''
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[lb]
+
+
+def _norm(s):
+    return (s or '').strip().lower()
+
+
+def type_is_correct(answer, target):
+    """1 невірна літера в слові допускається (Левенштейн <= 1)."""
+    return levenshtein(_norm(answer), _norm(target)) <= 1
+
+
+def translation_variants(translation):
+    """Розбиває переклад на варіанти (кома/слеш/крапка з комою)."""
+    raw = (translation or '').replace('/', ',').replace(';', ',')
+    return [v.strip() for v in raw.split(',') if v.strip()]
+
+
 # ============ KEYBOARDS ============
+def persistent_kb():
+    return ReplyKeyboardMarkup(
+        [['📚 Меню', '🎯 Тест']],
+        resize_keyboard=True, is_persistent=True
+    )
+
+
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton('📚 Мої слова', callback_data='m:words:0'),
@@ -48,10 +102,44 @@ def back_kb(target='m:home'):
     return InlineKeyboardMarkup([[InlineKeyboardButton('◀️ Назад', callback_data=target)]])
 
 
+def test_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🎯 Тренування', callback_data='test:training')],
+        [InlineKeyboardButton('🏆 Офіційний тест', callback_data='test:official')],
+        [InlineKeyboardButton('◀️ Меню', callback_data='m:home')],
+    ])
+
+
+# ============ ONBOARDING ============
+def onboarding_text():
+    return (
+        '🎚 <b>Обери рівень складності</b>\n' + DIV + '\n'
+        'Від рівня залежить розмір партії та тип тесту:\n\n'
+        '🟢 <b>Легкий</b> — 4 слова, вибір з 3 кнопок\n'
+        '🔵 <b>Середній</b> — 7 слів, вибір з 5 кнопок\n'
+        '🟠 <b>Складний</b> — 10 слів, вибір з 8 кнопок\n'
+        '🔴 <b>Експерт</b> — 15 слів, писати вручну\n\n'
+        'Змінити можна будь-коли в ⚙️ Налаштуваннях.'
+    )
+
+
+def onboarding_kb():
+    rows = [[InlineKeyboardButton(f"{c['emoji']} {c['name']} — {c['desc']}",
+                                  callback_data=f'lvl:{n}')]
+            for n, c in LEVELS.items()]
+    return InlineKeyboardMarkup(rows)
+
+
+async def needs_onboarding(user_id):
+    return db.get_level(user_id) is None
+
+
 # ============ RENDER: HOME ============
 def render_home(user_id):
     u = db.get_user(user_id)
     name = u['name'] if u else ''
+    lvl = (u['level'] if u else None) or 3
+    conf = LEVELS.get(lvl, LEVELS[3])
     hour = _now().hour
     if 5 <= hour < 12:
         greet = f'🌅 Доброго ранку, {name}!'
@@ -67,6 +155,7 @@ def render_home(user_id):
     best = u['best_streak'] if u else 0
 
     lines = [greet, '', DIV]
+    lines.append(f'{conf["emoji"]} Рівень: {conf["name"]} ({conf["desc"]})')
     if batch_no:
         lines.append(f'📚 Партія #{batch_no} · {len(active)} слів')
     else:
@@ -186,7 +275,7 @@ def render_stats_week(user_id):
     maxv = max((d['answered'] for d in week), default=0) or 1
     total_ans = 0
     for d in week:
-        weekday = names[__import_weekday(d['date'])]
+        weekday = names[_weekday(d['date'])]
         filled = round(d['answered'] / maxv * 10)
         bar = '█' * filled + '░' * (10 - filled)
         text.append(f'{weekday} {bar} {d["answered"]}')
@@ -196,7 +285,7 @@ def render_stats_week(user_id):
     return '\n'.join(text), stats_tabs_kb('week')
 
 
-def __import_weekday(date_str):
+def _weekday(date_str):
     from datetime import datetime as _dt
     return _dt.strptime(date_str, '%Y-%m-%d').weekday()
 
@@ -229,14 +318,19 @@ def render_stats_all(user_id):
 
 # ============ RENDER: SETTINGS ============
 def render_settings(user_id):
+    u = db.get_user(user_id)
+    lvl = (u['level'] if u else None) or 3
+    conf = LEVELS.get(lvl, LEVELS[3])
     paused = db.is_paused(user_id)
     text = ['⚙️ <b>Налаштування</b>', DIV]
+    text.append(f'{conf["emoji"]} Рівень: <b>{conf["name"]}</b> ({conf["desc"]})')
+    text.append(DIV)
     text.append('🕘 Нагадування (за Хошиміном):')
     text.append('9:00 · 12:00 · 15:00 · 18:00 · 21:00')
     text.append(DIV)
     text.append('⏸ Пауза: ' + ('так, на паузі' if paused else 'вимкнено'))
 
-    rows = []
+    rows = [[InlineKeyboardButton('🎚 Змінити рівень', callback_data='s:level')]]
     if paused:
         rows.append([InlineKeyboardButton('▶️ Зняти паузу', callback_data='s:unpause')])
     else:
@@ -250,19 +344,49 @@ def render_settings(user_id):
     return '\n'.join(text), InlineKeyboardMarkup(rows)
 
 
+def render_level_picker(user_id):
+    u = db.get_user(user_id)
+    cur = (u['level'] if u else None) or 3
+    text = ['🎚 <b>Рівень складності</b>', DIV,
+            'Нові слова будуть формуватись у партії за обраним рівнем.', '']
+    rows = []
+    for n, c in LEVELS.items():
+        mark = ' ✅' if n == cur else ''
+        rows.append([InlineKeyboardButton(f'{c["emoji"]} {c["name"]} — {c["desc"]}{mark}',
+                                          callback_data=f'setlvl:{n}')])
+    rows.append([InlineKeyboardButton('◀️ Назад', callback_data='m:settings')])
+    return '\n'.join(text), InlineKeyboardMarkup(rows)
+
+
 # ============ COMMANDS ============
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.add_user(user.id, user.first_name)
-    text, kb = render_home(user.id)
+
+    if await needs_onboarding(user.id):
+        await update.message.reply_text(
+            f'👋 Привіт, {user.first_name}! Я допоможу вивчати англійські слова '
+            f'методом інтервального повторення.',
+            reply_markup=persistent_kb()
+        )
+        await update.message.reply_text(
+            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML
+        )
+        return
+
     await update.message.reply_text(
-        f'👋 Привіт, {user.first_name}! Я допоможу вивчати англійські слова.\n\n' + text,
-        reply_markup=kb, parse_mode=ParseMode.HTML
+        f'👋 Привіт, {user.first_name}!', reply_markup=persistent_kb()
     )
+    text, kb = render_home(user.id)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_user(update.effective_user.id, update.effective_user.first_name)
+    if await needs_onboarding(update.effective_user.id):
+        await update.message.reply_text(
+            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+        return
     if context.args:
         await process_new_words(update.effective_user.id, ' '.join(context.args),
                                 update.message, context)
@@ -276,6 +400,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await needs_onboarding(update.effective_user.id):
+        await update.message.reply_text(
+            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+        return
     text, kb = render_home(update.effective_user.id)
     await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -287,7 +415,7 @@ async def process_new_words(user_id, raw_text, message, context):
         c = chunk.strip().lower()
         if c:
             parts.append(c)
-    parts = [p for p in dict.fromkeys(parts)]  # unique, keep order
+    parts = [p for p in dict.fromkeys(parts)]
 
     if not parts:
         await message.reply_text('Не знайшов слів. Спробуй: struggle, effort, empty')
@@ -307,78 +435,215 @@ async def process_new_words(user_id, raw_text, message, context):
         return
 
     added = db.add_words(user_id, words_data)
+    bsize = db.batch_size_for(user_id)
 
     lines = [f'✅ Додано {added} слів:', DIV]
     for wd in words_data:
         lines.append(f'• <b>{wd["word"].upper()}</b> 🔊 {wd["transcription"]} — {wd["translation"]}')
     lines.append('')
-    lines.append('Слова розбито на партії по 10. Перша партія активна! 🚀')
+    lines.append(f'Слова розбито на партії по {bsize}. Перша партія активна! 🚀')
 
     await status.edit_text('\n'.join(lines), parse_mode=ParseMode.HTML,
                            reply_markup=main_menu_kb())
 
 
-# ============ QUIZ ENGINE (UA -> EN typing) ============
+# ============ QUIZ ENGINE ============
+def build_question(user_id, w, level):
+    conf = LEVELS[level]
+    direction = random.choice(['ua2en', 'en2uk'])
+    payload = {'word_id': w['id'], 'direction': direction, 'mode': conf['mode']}
+
+    if conf['mode'] == 'type':
+        return payload
+
+    nbtn = conf['buttons']
+    if direction == 'ua2en':
+        correct = w['word']
+        pool = list(w.get('distractors_en', []) or [])
+        fallback = [d['en'] for d in FALLBACK_DISTRACTORS]
+        prompt = w['translation']
+        flag = '🇺🇦'
+    else:
+        correct = w['translation']
+        pool = list(w.get('distractors_uk', []) or [])
+        fallback = [d['uk'] for d in FALLBACK_DISTRACTORS]
+        prompt = w['word']
+        flag = '🇬🇧'
+
+    seen = {_norm(correct)}
+    uniq = []
+    for d in pool:
+        if _norm(d) and _norm(d) not in seen:
+            seen.add(_norm(d))
+            uniq.append(d)
+    random.shuffle(uniq)
+
+    need = nbtn - 1
+    chosen = uniq[:need]
+    if len(chosen) < need:
+        fb = [d for d in fallback if _norm(d) not in seen]
+        random.shuffle(fb)
+        for d in fb:
+            chosen.append(d)
+            seen.add(_norm(d))
+            if len(chosen) >= need:
+                break
+
+    options = chosen + [correct]
+    random.shuffle(options)
+    correct_index = options.index(correct)
+    payload.update({'options': options, 'correct_index': correct_index,
+                    'prompt': prompt, 'flag': flag})
+    return payload
+
+
 async def start_quiz(user_id, kind, context, chat_id):
     words = db.get_active_batch_words(user_id)
     if not words:
         await context.bot.send_message(chat_id, '📭 Немає активних слів для тесту.')
         return False
-    import random
     ids = [w['id'] for w in words]
     random.shuffle(ids)
     db.start_quiz(user_id, kind, ids)
+
+    lvl = db.get_level(user_id) or 3
+    conf = LEVELS[lvl]
+    mode_hint = ('обирай правильний варіант кнопкою'
+                 if conf['mode'] == 'choice' else 'пиши відповідь вручну')
     if kind == 'official':
         await context.bot.send_message(
             chat_id,
             f'🏆 <b>ОФІЦІЙНИЙ ТЕСТ</b>\n{DIV}\n'
-            f'{len(ids)} слів. Напиши кожне правильно — і відкриється наступна партія!\n'
+            f'{len(ids)} слів · {conf["emoji"]} {conf["name"]}\n'
+            f'Дай усе правильно — і відкриється наступна партія!\n'
             f'Помилка = доведеться повторити.',
             parse_mode=ParseMode.HTML
         )
     else:
         await context.bot.send_message(
             chat_id,
-            f'🎯 <b>Тренування</b>\n{DIV}\n{len(ids)} слів. Пиши англійською 💪',
+            f'🎯 <b>Тренування</b>\n{DIV}\n{len(ids)} слів · {mode_hint} 💪',
             parse_mode=ParseMode.HTML
         )
-    await send_next_question(user_id, context, chat_id)
+    await present_question(user_id, context, chat_id)
     return True
 
 
-async def send_next_question(user_id, context, chat_id):
+async def present_question(user_id, context, chat_id):
     wid = db.quiz_next(user_id)
     if wid is None:
         await finish_quiz(user_id, context, chat_id)
         return
     w = db.get_word_by_id(user_id, wid)
     if not w:
-        await send_next_question(user_id, context, chat_id)
+        await present_question(user_id, context, chat_id)
         return
-    hint = w['word'][:2] + '…'
+
+    lvl = db.get_level(user_id) or 3
+    payload = build_question(user_id, w, lvl)
+    db.set_current_question(user_id, payload)
+
     q = db.get_quiz(user_id)
     done = q['total'] - len(q['remaining'])
-    await context.bot.send_message(
-        chat_id,
-        f'✍️ <b>{done}/{q["total"]}</b>\n\n'
-        f'Напиши англійською:\n'
-        f'🇺🇦 <b>{w["translation"].upper()}</b>\n'
-        f'🔊 підказка: {hint}',
-        parse_mode=ParseMode.HTML
-    )
+    total = q['total']
+
+    if payload['mode'] == 'choice':
+        flag = payload['flag']
+        prompt = payload['prompt']
+        rows = []
+        for i, opt in enumerate(payload['options']):
+            rows.append([InlineKeyboardButton(f'{LETTERS[i]}  {opt}',
+                                              callback_data=f'qa:{i}')])
+        await context.bot.send_message(
+            chat_id,
+            f'❓ <b>{done}/{total}</b>\n{DIV}\n'
+            f'{flag} <b>{prompt.upper()}</b>\n\n'
+            f'Обери правильний варіант 👇',
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+    else:
+        direction = payload['direction']
+        w_full = db.get_word_by_id(user_id, wid)
+        if direction == 'ua2en':
+            flag, prompt, instr = '🇺🇦', w_full['translation'], 'Напиши англійською 👇'
+        else:
+            flag, prompt, instr = '🇬🇧', w_full['word'], 'Напиши переклад українською 👇'
+        await context.bot.send_message(
+            chat_id,
+            f'✍️ <b>{done}/{total}</b>\n{DIV}\n'
+            f'{flag} <b>{prompt.upper()}</b>\n\n{instr}',
+            parse_mode=ParseMode.HTML
+        )
 
 
-async def handle_quiz_answer(user_id, text, context, chat_id):
+async def handle_choice_answer(user_id, selected, context, chat_id, query):
     q = db.get_quiz(user_id)
-    if not q or q['current_word_id'] is None:
+    if not q or not q['current_q'] or q['current_word_id'] is None:
+        return
+    payload = q['current_q']
+    if payload.get('mode') != 'choice':
+        return
+    w = db.get_word_by_id(user_id, q['current_word_id'])
+    if not w:
+        return
+
+    options = payload['options']
+    correct_index = payload['correct_index']
+    if selected < 0 or selected >= len(options):
+        return
+    correct = (selected == correct_index)
+    chosen_text = options[selected]
+    db.record_answer(user_id, w['id'], correct,
+                     user_typed=None if correct else chosen_text)
+    db.quiz_record(user_id, correct)
+
+    # прибрати кнопки з питання
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if correct:
+        await context.bot.send_message(chat_id, f'✅ Правильно! <b>{options[correct_index]}</b>',
+                                       parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(
+            chat_id,
+            f'❌ Не вгадав.\n'
+            f'Ти обрав: <s>{chosen_text}</s>\n'
+            f'✅ Правильно: <b>{options[correct_index]}</b>\n'
+            f'🔊 {w["transcription"]} · {w["word"].upper()} — {w["translation"]}\n\n'
+            f'▸ <i>{w["example1"]}</i>',
+            parse_mode=ParseMode.HTML
+        )
+    await asyncio.sleep(0.4)
+    await present_question(user_id, context, chat_id)
+
+
+async def handle_type_answer(user_id, text, context, chat_id):
+    q = db.get_quiz(user_id)
+    if not q or not q['current_q'] or q['current_word_id'] is None:
+        return False
+    payload = q['current_q']
+    if payload.get('mode') != 'type':
         return False
     w = db.get_word_by_id(user_id, q['current_word_id'])
     if not w:
         return False
 
-    answer = text.strip().lower()
-    correct = answer == w['word'].lower()
-    db.record_answer(user_id, w['id'], correct, user_typed=None if correct else answer)
+    answer = text.strip()
+    direction = payload['direction']
+    if direction == 'ua2en':
+        correct = type_is_correct(answer, w['word'])
+        right_text = w['word'].upper()
+    else:
+        variants = translation_variants(w['translation']) or [w['translation']]
+        correct = any(type_is_correct(answer, v) for v in variants)
+        right_text = w['translation']
+
+    db.record_answer(user_id, w['id'], correct,
+                     user_typed=None if correct else answer)
     db.quiz_record(user_id, correct)
 
     if correct:
@@ -388,14 +653,14 @@ async def handle_quiz_answer(user_id, text, context, chat_id):
             chat_id,
             f'❌ Майже!\n'
             f'Ти написав: <s>{answer}</s>\n'
-            f'✅ Правильно: <b>{w["word"].upper()}</b>\n'
+            f'✅ Правильно: <b>{right_text}</b>\n'
             f'🔊 {w["transcription"]}\n\n'
             f'▸ <i>{w["example1"]}</i>\n'
             f'▸ <i>{w["example2"]}</i>',
             parse_mode=ParseMode.HTML
         )
     await asyncio.sleep(0.4)
-    await send_next_question(user_id, context, chat_id)
+    await present_question(user_id, context, chat_id)
     return True
 
 
@@ -463,6 +728,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'noop':
         return
 
+    # ----- ONBOARDING level pick -----
+    if data.startswith('lvl:'):
+        lvl = int(data.split(':')[1])
+        db.set_level(user_id, lvl)
+        conf = LEVELS[lvl]
+        await safe_edit(query,
+                        f'✅ Рівень: {conf["emoji"]} <b>{conf["name"]}</b> ({conf["desc"]})',
+                        None)
+        await context.bot.send_message(
+            chat_id, 'Готово! Натисни ➕ Додати, щоб завантажити перші слова.',
+            reply_markup=persistent_kb())
+        text, kb = render_home(user_id)
+        await context.bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    # якщо ще не пройшов онбординг — змусити
+    if await needs_onboarding(user_id):
+        return await safe_edit(query, onboarding_text(), onboarding_kb())
+
+    # ----- QUIZ choice answer -----
+    if data.startswith('qa:'):
+        selected = int(data.split(':')[1])
+        await handle_choice_answer(user_id, selected, context, chat_id, query)
+        return
+
     # HOME
     if data == 'm:home':
         text, kb = render_home(user_id)
@@ -510,21 +800,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # TEST
     if data == 'm:test':
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton('🎯 Тренування', callback_data='test:training')],
-            [InlineKeyboardButton('🏆 Офіційний тест', callback_data='test:official')],
-            [InlineKeyboardButton('◀️ Меню', callback_data='m:home')],
-        ])
         return await safe_edit(
             query,
             f'🎯 <b>Тести</b>\n{DIV}\n'
             f'🎯 <b>Тренування</b> — будь-коли, не впливає на прогрес\n'
             f'🏆 <b>Офіційний</b> — лише 21:00–00:00, 100% відкриває нову партію',
-            kb
+            test_menu_kb()
         )
 
     if data == 'test:training':
-        await query.message.delete()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         await start_quiz(user_id, 'training', context, chat_id)
         return
 
@@ -544,12 +832,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f'⏳ Зачекай ще <b>{rem // 60} хв {rem % 60} с</b> перед наступною спробою.',
                 back_kb('m:test')
             )
-        await query.message.delete()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         await start_quiz(user_id, 'official', context, chat_id)
         return
 
     # SETTINGS
     if data == 'm:settings':
+        text, kb = render_settings(user_id)
+        return await safe_edit(query, text, kb)
+    if data == 's:level':
+        text, kb = render_level_picker(user_id)
+        return await safe_edit(query, text, kb)
+    if data.startswith('setlvl:'):
+        lvl = int(data.split(':')[1])
+        db.set_level(user_id, lvl)
+        await query.answer(f'✅ Рівень: {LEVELS[lvl]["name"]}')
         text, kb = render_settings(user_id)
         return await safe_edit(query, text, kb)
     if data.startswith('s:pause:'):
@@ -588,22 +888,48 @@ async def safe_edit(query, text, kb):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.add_user(user_id, update.effective_user.first_name)
-    text = update.message.text
+    text = update.message.text or ''
+    chat_id = update.message.chat_id
 
-    # Active quiz?
+    # Постійні кнопки внизу
+    if text == '📚 Меню':
+        if await needs_onboarding(user_id):
+            return await update.message.reply_text(
+                onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+        home, kb = render_home(user_id)
+        return await update.message.reply_text(home, reply_markup=kb, parse_mode=ParseMode.HTML)
+    if text == '🎯 Тест':
+        if await needs_onboarding(user_id):
+            return await update.message.reply_text(
+                onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+        return await update.message.reply_text(
+            f'🎯 <b>Тести</b>\n{DIV}\n'
+            f'🎯 <b>Тренування</b> — будь-коли\n'
+            f'🏆 <b>Офіційний</b> — 21:00–00:00, 100% відкриває нову партію',
+            reply_markup=test_menu_kb(), parse_mode=ParseMode.HTML)
+
+    if await needs_onboarding(user_id):
+        return await update.message.reply_text(
+            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+
+    # Активний тест?
     q = db.get_quiz(user_id)
-    if q and q['current_word_id'] is not None:
-        handled = await handle_quiz_answer(user_id, text, context, update.message.chat_id)
-        if handled:
-            return
+    if q and q['current_q'] and q['current_word_id'] is not None:
+        if q['current_q'].get('mode') == 'type':
+            handled = await handle_type_answer(user_id, text, context, chat_id)
+            if handled:
+                return
+        else:
+            # питання з кнопками — підкажемо тиснути кнопку
+            return await update.message.reply_text('👆 Обери відповідь кнопкою вище.')
 
-    # Adding words?
+    # Додавання слів?
     if context.user_data.get('state') == 'adding':
         context.user_data['state'] = None
         await process_new_words(user_id, text, update.message, context)
         return
 
-    # Default: show menu
+    # За замовчуванням — меню
     home, kb = render_home(user_id)
     await update.message.reply_text(home, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -613,6 +939,8 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     kind = context.job.data
     for u in db.get_all_users():
         uid = u['user_id']
+        if u.get('level') is None:
+            continue
         if db.is_paused(uid):
             continue
         words = db.get_active_batch_words(uid)
@@ -670,7 +998,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    logger.info('WordFlow bot starting...')
+    logger.info('WordFlow bot v2 starting...')
     app.run_polling(drop_pending_updates=True)
 
 

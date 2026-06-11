@@ -7,6 +7,10 @@ import pytz
 TZ = pytz.timezone('Asia/Ho_Chi_Minh')
 DB_PATH = os.environ.get('DB_PATH', 'wordflow.db')
 
+# Розмір партії за рівнем (рівень також визначає режим тесту в bot.py)
+LEVEL_BATCH = {1: 4, 2: 7, 3: 10, 4: 15}
+DEFAULT_BATCH = 10
+
 
 def _now():
     return datetime.now(TZ)
@@ -33,6 +37,7 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     name TEXT,
                     created_at TEXT,
+                    level INTEGER,
                     current_streak INTEGER DEFAULT 0,
                     best_streak INTEGER DEFAULT 0,
                     last_active_date TEXT,
@@ -48,6 +53,8 @@ class Database:
                     translation TEXT,
                     example1 TEXT,
                     example2 TEXT,
+                    distractors_en TEXT,
+                    distractors_uk TEXT,
                     batch_number INTEGER,
                     correct_answers INTEGER DEFAULT 0,
                     total_answers INTEGER DEFAULT 0,
@@ -60,6 +67,7 @@ class Database:
                     user_id INTEGER,
                     batch_number INTEGER,
                     status TEXT DEFAULT 'locked',
+                    size INTEGER DEFAULT 10,
                     PRIMARY KEY (user_id, batch_number)
                 );
 
@@ -77,9 +85,35 @@ class Database:
                     remaining TEXT,
                     total INTEGER,
                     current_word_id INTEGER,
+                    current_q TEXT,
                     results TEXT
                 );
             ''')
+        self._migrate()
+
+    def _migrate(self):
+        """Безпечно додає нові колонки до вже існуючої бази (v1 -> v2)."""
+        with self._conn() as conn:
+            def cols(table):
+                return {r['name'] for r in conn.execute(f'PRAGMA table_info({table})').fetchall()}
+
+            ucols = cols('users')
+            if 'level' not in ucols:
+                conn.execute('ALTER TABLE users ADD COLUMN level INTEGER')
+
+            wcols = cols('words')
+            if 'distractors_en' not in wcols:
+                conn.execute('ALTER TABLE words ADD COLUMN distractors_en TEXT')
+            if 'distractors_uk' not in wcols:
+                conn.execute('ALTER TABLE words ADD COLUMN distractors_uk TEXT')
+
+            bcols = cols('batches')
+            if 'size' not in bcols:
+                conn.execute('ALTER TABLE batches ADD COLUMN size INTEGER DEFAULT 10')
+
+            qcols = cols('quiz_session')
+            if 'current_q' not in qcols:
+                conn.execute('ALTER TABLE quiz_session ADD COLUMN current_q TEXT')
 
     # ---------------- USERS ----------------
     def add_user(self, user_id, name):
@@ -98,6 +132,20 @@ class Database:
         with self._conn() as conn:
             return [dict(r) for r in conn.execute('SELECT * FROM users').fetchall()]
 
+    def get_level(self, user_id):
+        u = self.get_user(user_id)
+        if not u:
+            return None
+        return u['level']
+
+    def set_level(self, user_id, level):
+        with self._conn() as conn:
+            conn.execute('UPDATE users SET level=? WHERE user_id=?', (int(level), user_id))
+
+    def batch_size_for(self, user_id):
+        lvl = self.get_level(user_id) or 3
+        return LEVEL_BATCH.get(lvl, DEFAULT_BATCH)
+
     # ---------------- WORDS / BATCHES ----------------
     def word_exists(self, user_id, word):
         with self._conn() as conn:
@@ -108,8 +156,9 @@ class Database:
             return r is not None
 
     def _last_open_batch(self, conn, user_id):
+        """Останя незавершена партія, у якій ще є вільні місця (cnt < size)."""
         rows = conn.execute('''
-            SELECT b.batch_number,
+            SELECT b.batch_number, b.size,
                    (SELECT COUNT(*) FROM words w
                     WHERE w.user_id=b.user_id AND w.batch_number=b.batch_number AND w.learned=0) AS cnt
             FROM batches b
@@ -117,9 +166,10 @@ class Database:
             ORDER BY b.batch_number DESC
         ''', (user_id,)).fetchall()
         for r in rows:
-            if r['cnt'] < 10:
-                return r['batch_number'], r['cnt']
-        return None, 0
+            size = r['size'] or DEFAULT_BATCH
+            if r['cnt'] < size:
+                return r['batch_number'], r['cnt'], size
+        return None, 0, None
 
     def _has_active_batch(self, conn, user_id):
         r = conn.execute(
@@ -127,11 +177,13 @@ class Database:
         ).fetchone()
         return r is not None
 
-    def add_words(self, user_id, words_data):
+    def add_words(self, user_id, words_data, batch_size=None):
+        if batch_size is None:
+            batch_size = self.batch_size_for(user_id)
         today = _today()
         added = 0
         with self._conn() as conn:
-            batch_num, count = self._last_open_batch(conn, user_id)
+            batch_num, count, cur_size = self._last_open_batch(conn, user_id)
             if batch_num is None:
                 maxb = conn.execute(
                     'SELECT COALESCE(MAX(batch_number),0) AS m FROM batches WHERE user_id=?',
@@ -139,29 +191,35 @@ class Database:
                 ).fetchone()['m']
                 batch_num = maxb + 1
                 count = 0
+                cur_size = batch_size
                 status = 'active' if not self._has_active_batch(conn, user_id) else 'locked'
                 conn.execute(
-                    'INSERT OR IGNORE INTO batches (user_id, batch_number, status) VALUES (?,?,?)',
-                    (user_id, batch_num, status)
+                    'INSERT OR IGNORE INTO batches (user_id, batch_number, status, size) VALUES (?,?,?,?)',
+                    (user_id, batch_num, status, cur_size)
                 )
 
             for wd in words_data:
                 if self.word_exists(user_id, wd['word']):
                     continue
-                if count >= 10:
+                if count >= cur_size:
                     batch_num += 1
                     count = 0
+                    cur_size = batch_size
                     status = 'active' if not self._has_active_batch(conn, user_id) else 'locked'
                     conn.execute(
-                        'INSERT OR IGNORE INTO batches (user_id, batch_number, status) VALUES (?,?,?)',
-                        (user_id, batch_num, status)
+                        'INSERT OR IGNORE INTO batches (user_id, batch_number, status, size) VALUES (?,?,?,?)',
+                        (user_id, batch_num, status, cur_size)
                     )
                 conn.execute('''
                     INSERT INTO words
-                    (user_id, word, transcription, translation, example1, example2, batch_number, added_date)
-                    VALUES (?,?,?,?,?,?,?,?)
+                    (user_id, word, transcription, translation, example1, example2,
+                     distractors_en, distractors_uk, batch_number, added_date)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
                 ''', (user_id, wd['word'], wd['transcription'], wd['translation'],
-                      wd['example1'], wd['example2'], batch_num, today))
+                      wd['example1'], wd['example2'],
+                      json.dumps(wd.get('distractors_en', []), ensure_ascii=False),
+                      json.dumps(wd.get('distractors_uk', []), ensure_ascii=False),
+                      batch_num, today))
                 count += 1
                 added += 1
         return added
@@ -174,6 +232,18 @@ class Database:
             ).fetchone()
             return r['batch_number'] if r else None
 
+    def _row_to_word(self, r):
+        w = dict(r)
+        try:
+            w['distractors_en'] = json.loads(w['distractors_en']) if w.get('distractors_en') else []
+        except Exception:
+            w['distractors_en'] = []
+        try:
+            w['distractors_uk'] = json.loads(w['distractors_uk']) if w.get('distractors_uk') else []
+        except Exception:
+            w['distractors_uk'] = []
+        return w
+
     def get_active_batch_words(self, user_id):
         bn = self.get_active_batch_number(user_id)
         if bn is None:
@@ -183,7 +253,7 @@ class Database:
                 'SELECT * FROM words WHERE user_id=? AND batch_number=? AND learned=0 ORDER BY id',
                 (user_id, bn)
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [self._row_to_word(r) for r in rows]
 
     def get_all_active_words(self, user_id):
         with self._conn() as conn:
@@ -191,14 +261,14 @@ class Database:
                 'SELECT * FROM words WHERE user_id=? AND learned=0 ORDER BY batch_number, id',
                 (user_id,)
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [self._row_to_word(r) for r in rows]
 
     def get_word_by_id(self, user_id, word_id):
         with self._conn() as conn:
             r = conn.execute(
                 'SELECT * FROM words WHERE user_id=? AND id=?', (user_id, word_id)
             ).fetchone()
-            return dict(r) if r else None
+            return self._row_to_word(r) if r else None
 
     def mark_learned(self, user_id, word_id):
         with self._conn() as conn:
@@ -211,7 +281,7 @@ class Database:
     def get_batches(self, user_id):
         with self._conn() as conn:
             rows = conn.execute('''
-                SELECT b.batch_number, b.status,
+                SELECT b.batch_number, b.status, b.size,
                    (SELECT COUNT(*) FROM words w WHERE w.user_id=b.user_id
                     AND w.batch_number=b.batch_number) AS total,
                    (SELECT COUNT(*) FROM words w WHERE w.user_id=b.user_id
@@ -324,7 +394,7 @@ class Database:
             rows = conn.execute(
                 'SELECT * FROM words WHERE user_id=? AND learned=1 ORDER BY id', (user_id,)
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [self._row_to_word(r) for r in rows]
 
     def get_weak_words_active_batch(self, user_id, limit=3):
         words = self.get_active_batch_words(user_id)
@@ -375,9 +445,9 @@ class Database:
         with self._conn() as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO quiz_session
-                (user_id, kind, remaining, total, current_word_id, results)
-                VALUES (?,?,?,?,?,?)
-            ''', (user_id, kind, json.dumps(word_ids), len(word_ids), None, json.dumps({})))
+                (user_id, kind, remaining, total, current_word_id, current_q, results)
+                VALUES (?,?,?,?,?,?,?)
+            ''', (user_id, kind, json.dumps(word_ids), len(word_ids), None, None, json.dumps({})))
 
     def get_quiz(self, user_id):
         with self._conn() as conn:
@@ -389,6 +459,7 @@ class Database:
                 'remaining': json.loads(r['remaining']) if r['remaining'] else [],
                 'total': r['total'],
                 'current_word_id': r['current_word_id'],
+                'current_q': json.loads(r['current_q']) if r['current_q'] else None,
                 'results': json.loads(r['results']) if r['results'] else {},
             }
 
@@ -400,10 +471,15 @@ class Database:
         rest = q['remaining'][1:]
         with self._conn() as conn:
             conn.execute(
-                'UPDATE quiz_session SET remaining=?, current_word_id=? WHERE user_id=?',
+                'UPDATE quiz_session SET remaining=?, current_word_id=?, current_q=NULL WHERE user_id=?',
                 (json.dumps(rest), nxt, user_id)
             )
         return nxt
+
+    def set_current_question(self, user_id, payload):
+        with self._conn() as conn:
+            conn.execute('UPDATE quiz_session SET current_q=? WHERE user_id=?',
+                         (json.dumps(payload, ensure_ascii=False), user_id))
 
     def quiz_record(self, user_id, correct):
         q = self.get_quiz(user_id)
