@@ -648,7 +648,11 @@ async def generate_cefr_batch(user_id, context, chat_id):
 
     while len(words_data) < size and attempts < max_attempts:
         attempts += 1
-        info = await generate_cefr_word(cefr, list(seen))
+        try:
+            info = await generate_cefr_word(cefr, list(seen))
+        except Exception as e:
+            logger.error(f'generate_cefr_word error: {e}')
+            info = None
         if not info:
             continue
         w = info['word'].lower()
@@ -659,7 +663,13 @@ async def generate_cefr_batch(user_id, context, chat_id):
         words_data.append(info)
 
     if not words_data:
-        await status.edit_text('😕 Не вдалось згенерувати слова. Спробуй ще раз пізніше.')
+        logger.error(f'generate_cefr_batch: 0 words after {attempts} attempts for cefr={cefr}')
+        await status.edit_text(
+            f'😕 Не вдалось згенерувати слова ({attempts} спроб). '
+            f'Перевір CLAUDE_API_KEY або спробуй ще раз через хвилину.',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                '🔄 Спробувати ще раз', callback_data='cefr:gen')]])
+        )
         return False
 
     db.add_words(user_id, words_data, batch_size=size)
@@ -1131,9 +1141,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f'✅ Складність: {conf["emoji"]} <b>{conf["name"]}</b> ({conf["desc"]})',
                         None)
         if src == 'cefr':
+            cefr = db.get_cefr_level(user_id)
             await context.bot.send_message(chat_id, 'Готово! 🎓', reply_markup=persistent_kb())
-            # одразу генеруємо першу партію
-            await generate_cefr_batch(user_id, context, chat_id)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                '🎓 Отримати перші слова', callback_data='cefr:gen')]])
+            await context.bot.send_message(
+                chat_id,
+                f'Рівень {cefr} обрано. Натисни кнопку щоб згенерувати перші слова 👇',
+                reply_markup=kb
+            )
         else:
             await context.bot.send_message(
                 chat_id, 'Готово! Натисни ➕ Додати, щоб завантажити перші слова.',
