@@ -124,7 +124,8 @@ def main_menu_kb(user_id=None):
         [InlineKeyboardButton('📊 Статистика', callback_data='m:stats:today'),
          InlineKeyboardButton('🎯 Тест', callback_data='m:test')],
     ]
-    rows.append([InlineKeyboardButton('⚙️ Налаштування', callback_data='m:settings')])
+    rows.append([InlineKeyboardButton('⚙️ Налаштування', callback_data='m:settings'),
+                 InlineKeyboardButton('ℹ️ Інструкція', callback_data='m:help')])
     return InlineKeyboardMarkup(rows)
 
 
@@ -156,6 +157,7 @@ def onboarding_source_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton('🎓 За рівнем CEFR', callback_data='src:cefr')],
         [InlineKeyboardButton('✍️ Свої слова', callback_data='src:own')],
+        [InlineKeyboardButton('ℹ️ Як це працює', callback_data='m:help')],
     ])
 
 
@@ -498,6 +500,7 @@ def render_settings(user_id):
             InlineKeyboardButton('⏸ 7 днів', callback_data='s:pause:7'),
         ])
     rows.append([InlineKeyboardButton('📤 Експорт слів', callback_data='s:export')])
+    rows.append([InlineKeyboardButton('ℹ️ Як це працює', callback_data='m:help')])
     if src == 'cefr':
         rows.append([InlineKeyboardButton('🎓 Отримати слова', callback_data='cefr:gen')])
     rows.append([InlineKeyboardButton('◀️ Меню', callback_data='m:home')])
@@ -587,6 +590,45 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text, kb = render_home(update.effective_user.id)
     await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+def help_text():
+    return (
+        '📖 <b>Як користуватись WordFlow</b>\n' + DIV + '\n\n'
+        '<b>1. Звідки слова?</b>\n'
+        '🎓 <b>За рівнем CEFR (A1-C2)</b> — бот сам підбирає реальні слова '
+        'твого рівня та генерує партії.\n'
+        '✍️ <b>Свої слова</b> — додаєш будь-які слова через ➕ Додати, '
+        'бот робить переклад, транскрипцію та приклади.\n\n'
+        '<b>2. Рівень складності</b>\n'
+        '🟢 Легкий (4 слова, вибір з 3)\n'
+        '🔵 Середній (7 слів, вибір з 5)\n'
+        '🟠 Складний (10 слів, вибір з 8)\n'
+        '🔴 Експерт (15 слів, писати вручну, є підказки)\n\n'
+        '<b>3. Як вчити</b>\n'
+        '📋 <b>Слова на сьогодні</b> — список активної партії з перекладом.\n'
+        '🎯 <b>Тренування</b> — будь-коли, не впливає на прогрес.\n'
+        '🏆 <b>Офіційний тест</b> — щодня 21:00–00:00. 100% правильно — '
+        'відкриває нову партію!\n\n'
+        '<b>4. Нагадування (за твоїм часовим поясом)</b>\n'
+        '⏰ 9:00 — слова на день\n'
+        '⏰ 10:30 — міні-тест\n'
+        '⏰ 12:00 — адаптивне тренування\n'
+        '⏰ 14:30 — речення з пропуском\n'
+        '⏰ 18:00 — адаптивне тренування\n'
+        '⏰ 21:00 — офіційний тест\n\n'
+        '<b>5. CEFR-прогрес</b>\n'
+        'Вивчиш 80/100 слів рівня — бот запропонує тест переходу '
+        'на наступний рівень.\n\n'
+        '⚙️ Все можна змінити в Налаштуваннях: складність, рівень CEFR, '
+        'джерело слів, часовий пояс, пауза.\n\n'
+        'Команди: /menu — головне меню, /add — додати слова, /help — ця довідка.'
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(help_text(), parse_mode=ParseMode.HTML,
+                                     reply_markup=back_kb())
 
 
 # ============ ADD WORDS ============
@@ -1041,9 +1083,13 @@ async def finish_quiz(user_id, context, chat_id):
                 await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
                 await generate_cefr_batch(user_id, context, chat_id)
             else:
-                msg += '🏆 Це була остання партія — ти красавчик!\nДодай нові слова через ➕ Додати.'
+                msg += '🏆 Це була остання партія — ти красавчик! 🎉\n\nЩо далі?'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('✍️ Додати свої слова', callback_data='m:add')],
+                    [InlineKeyboardButton('🎓 Перейти на CEFR (обрати рівень)', callback_data='s:src:cefr')],
+                ])
                 await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
-                                               reply_markup=main_menu_kb(user_id))
+                                               reply_markup=kb)
         else:
             db.set_official_cooldown(user_id, 10)
             msg = (f'😅 <b>{correct}/{total}</b>\n{DIV}\n'
@@ -1161,6 +1207,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, kb = render_home(user_id)
             await context.bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
+
+    # m:help і onboard:back доступні навіть під час онбордингу
+    if data == 'm:help':
+        if await needs_onboarding(user_id):
+            return await safe_edit(query, help_text(), back_kb('onboard:back'))
+        return await safe_edit(query, help_text(), back_kb('m:settings'))
+    if data == 'onboard:back':
+        return await send_onboarding_step(None, user_id, context, edit_query=query)
 
     # якщо ще не пройшов онбординг — змусити
     if await needs_onboarding(user_id):
@@ -1402,6 +1456,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await needs_onboarding(user_id):
         return await send_onboarding_step(update.message, user_id, context)
 
+    # Додавання слів? (перевіряємо ПЕРШИМ — пріоритетніше за зависле питання тесту)
+    if context.user_data.get('state') == 'adding':
+        context.user_data['state'] = None
+        db.clear_quiz(user_id)  # на випадок завислого питання
+        await process_new_words(user_id, text, update.message, context)
+        return
+
     # Активний тест?
     q = db.get_quiz(user_id)
     if q and q['current_q'] and q['current_word_id'] is not None:
@@ -1412,12 +1473,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # питання з кнопками — підкажемо тиснути кнопку
             return await update.message.reply_text('👆 Обери відповідь кнопкою вище.')
-
-    # Додавання слів?
-    if context.user_data.get('state') == 'adding':
-        context.user_data['state'] = None
-        await process_new_words(user_id, text, update.message, context)
-        return
 
     # За замовчуванням — меню
     home, kb = render_home(user_id)
@@ -1612,6 +1667,8 @@ def main():
     app.add_handler(CommandHandler('words', cmd_menu))
     app.add_handler(CommandHandler('stats', cmd_menu))
     app.add_handler(CommandHandler('test', cmd_menu))
+    app.add_handler(CommandHandler('help', cmd_help))
+    app.add_handler(CommandHandler('instruction', cmd_help))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
