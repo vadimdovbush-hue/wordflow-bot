@@ -331,6 +331,14 @@ class Database:
                 added += 1
         return added
 
+    def archive_active_batch(self, user_id):
+        """Завершує поточну активну партію (наприклад при зміні CEFR-рівня)."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE batches SET status='completed' WHERE user_id=? AND status='active'",
+                (user_id,)
+            )
+
     def get_active_batch_number(self, user_id):
         with self._conn() as conn:
             r = conn.execute(

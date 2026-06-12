@@ -1121,14 +1121,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith('cefr:') and data != 'cefr:gen':
         cefr = data.split(':')[1]
         if cefr in CEFR_LEVELS:
+            old_cefr = db.get_cefr_level(user_id)
             db.set_cefr_level(user_id, cefr)
             # якщо рівень складності ще не обрано — наступний крок
             if db.get_level(user_id) is None:
                 return await safe_edit(query, onboarding_text(), onboarding_kb())
-            # інакше це зміна рівня з налаштувань
-            await query.answer(f'✅ Рівень CEFR: {cefr}')
-            text, kb = render_settings(user_id)
-            return await safe_edit(query, text, kb)
+            # інакше це зміна рівня з налаштувань — завершуємо стару партію
+            # і одразу генеруємо нову для нового рівня
+            if old_cefr != cefr:
+                db.archive_active_batch(user_id)
+            await safe_edit(query, f'✅ Рівень CEFR: {cefr}', None)
+            await generate_cefr_batch(user_id, context, chat_id)
+            return
         return
 
     # ----- ONBOARDING: рівень складності -----
@@ -1184,6 +1188,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nxt = _next_cefr(cefr) if cefr else None
         if nxt:
             db.set_cefr_level(user_id, nxt)
+            db.archive_active_batch(user_id)
             await safe_edit(query,
                             f'🚀 <b>Вітаю з переходом на {nxt}!</b>\n{DIV}\n'
                             f'Генерую перші слова нового рівня...', None)
