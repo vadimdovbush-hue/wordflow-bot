@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 import random
-from datetime import time
+from datetime import time, datetime
 
 import pytz
 from telegram import (
@@ -482,11 +482,11 @@ def render_settings(user_id):
     text.append(DIV)
     text.append('⏸ Пауза: ' + ('так, на паузі' if paused else 'вимкнено'))
 
-    rows = [
-        [InlineKeyboardButton('🎚 Змінити складність', callback_data='s:level')],
-    ]
+    rows = []
     if src == 'cefr':
         rows.append([InlineKeyboardButton('🎓 Обрати рівень A1-C2', callback_data='s:cefr')])
+    rows.append([InlineKeyboardButton('🎚 Змінити складність', callback_data='s:level')])
+    if src == 'cefr':
         rows.append([InlineKeyboardButton('✍️ Перейти на свої слова', callback_data='s:src:own')])
     else:
         rows.append([InlineKeyboardButton('🎓 Перейти на рівні CEFR', callback_data='s:src:cefr')])
