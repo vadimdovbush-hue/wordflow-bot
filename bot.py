@@ -124,8 +124,6 @@ def main_menu_kb(user_id=None):
         [InlineKeyboardButton('📊 Статистика', callback_data='m:stats:today'),
          InlineKeyboardButton('🎯 Тест', callback_data='m:test')],
     ]
-    if user_id is not None and db.get_word_source(user_id) == 'cefr':
-        rows.insert(1, [InlineKeyboardButton('🎓 Згенерувати нові слова', callback_data='cefr:gen')])
     rows.append([InlineKeyboardButton('⚙️ Налаштування', callback_data='m:settings')])
     return InlineKeyboardMarkup(rows)
 
@@ -500,6 +498,8 @@ def render_settings(user_id):
             InlineKeyboardButton('⏸ 7 днів', callback_data='s:pause:7'),
         ])
     rows.append([InlineKeyboardButton('📤 Експорт слів', callback_data='s:export')])
+    if src == 'cefr':
+        rows.append([InlineKeyboardButton('🎓 Отримати слова', callback_data='cefr:gen')])
     rows.append([InlineKeyboardButton('◀️ Меню', callback_data='m:home')])
     return '\n'.join(text), InlineKeyboardMarkup(rows)
 
