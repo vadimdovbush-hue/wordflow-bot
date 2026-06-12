@@ -11,6 +11,11 @@ DB_PATH = os.environ.get('DB_PATH', 'wordflow.db')
 LEVEL_BATCH = {1: 4, 2: 7, 3: 10, 4: 15}
 DEFAULT_BATCH = 10
 
+CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
+CEFR_TARGET = 100          # ціль слів на рівень
+CEFR_ADVANCE_AT = 80       # скільки вивчити щоб пропонувати наступний рівень
+DAILY_HINTS = 2            # підказок на день (режим Експерт)
+
 
 def _now():
     return datetime.now(TZ)
@@ -43,7 +48,11 @@ class Database:
                     last_active_date TEXT,
                     paused_until TEXT,
                     official_cooldown TEXT,
-                    timezone TEXT DEFAULT 'Asia/Ho_Chi_Minh'
+                    timezone TEXT DEFAULT 'Asia/Ho_Chi_Minh',
+                    word_source TEXT,
+                    cefr_level TEXT,
+                    hints_date TEXT,
+                    hints_used INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS words (
@@ -61,7 +70,8 @@ class Database:
                     total_answers INTEGER DEFAULT 0,
                     last_wrong TEXT,
                     learned INTEGER DEFAULT 0,
-                    added_date TEXT
+                    added_date TEXT,
+                    cefr_level TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS batches (
@@ -103,12 +113,22 @@ class Database:
                 conn.execute('ALTER TABLE users ADD COLUMN level INTEGER')
             if 'timezone' not in ucols:
                 conn.execute("ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'Asia/Ho_Chi_Minh'")
+            if 'word_source' not in ucols:
+                conn.execute('ALTER TABLE users ADD COLUMN word_source TEXT')
+            if 'cefr_level' not in ucols:
+                conn.execute('ALTER TABLE users ADD COLUMN cefr_level TEXT')
+            if 'hints_date' not in ucols:
+                conn.execute('ALTER TABLE users ADD COLUMN hints_date TEXT')
+            if 'hints_used' not in ucols:
+                conn.execute('ALTER TABLE users ADD COLUMN hints_used INTEGER DEFAULT 0')
 
             wcols = cols('words')
             if 'distractors_en' not in wcols:
                 conn.execute('ALTER TABLE words ADD COLUMN distractors_en TEXT')
             if 'distractors_uk' not in wcols:
                 conn.execute('ALTER TABLE words ADD COLUMN distractors_uk TEXT')
+            if 'cefr_level' not in wcols:
+                conn.execute('ALTER TABLE words ADD COLUMN cefr_level TEXT')
 
             bcols = cols('batches')
             if 'size' not in bcols:
@@ -154,6 +174,80 @@ class Database:
     def set_timezone(self, user_id, tz):
         with self._conn() as conn:
             conn.execute('UPDATE users SET timezone=? WHERE user_id=?', (tz, user_id))
+
+    def get_word_source(self, user_id):
+        u = self.get_user(user_id)
+        return u.get('word_source') if u else None
+
+    def set_word_source(self, user_id, src):
+        with self._conn() as conn:
+            conn.execute('UPDATE users SET word_source=? WHERE user_id=?', (src, user_id))
+
+    def get_cefr_level(self, user_id):
+        u = self.get_user(user_id)
+        return u.get('cefr_level') if u else None
+
+    def set_cefr_level(self, user_id, cefr):
+        with self._conn() as conn:
+            conn.execute('UPDATE users SET cefr_level=? WHERE user_id=?', (cefr, user_id))
+
+    def cefr_recent_words(self, user_id, cefr, limit=40):
+        """Останні слова цього CEFR-рівня (щоб не повторювати при генерації)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                'SELECT word FROM words WHERE user_id=? AND cefr_level=? ORDER BY id DESC LIMIT ?',
+                (user_id, cefr, limit)
+            ).fetchall()
+            return [r['word'] for r in rows]
+
+    def cefr_mastered_count(self, user_id, cefr):
+        """Скільки слів рівня вивчено (learned=1 АБО точність>=70% при >=3 відповідях)."""
+        with self._conn() as conn:
+            r = conn.execute('''
+                SELECT COUNT(*) AS c FROM words
+                WHERE user_id=? AND cefr_level=?
+                  AND (learned=1 OR (total_answers>=3 AND correct_answers*1.0/total_answers>=0.7))
+            ''', (user_id, cefr)).fetchone()
+            return r['c'] if r else 0
+
+    def cefr_total_count(self, user_id, cefr):
+        with self._conn() as conn:
+            r = conn.execute(
+                'SELECT COUNT(*) AS c FROM words WHERE user_id=? AND cefr_level=?',
+                (user_id, cefr)
+            ).fetchone()
+            return r['c'] if r else 0
+
+    def cefr_words_for_test(self, user_id, cefr, limit=50):
+        """Слова рівня для тесту переходу (вивчені + активні)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                'SELECT * FROM words WHERE user_id=? AND cefr_level=? ORDER BY RANDOM() LIMIT ?',
+                (user_id, cefr, limit)
+            ).fetchall()
+            return [self._row_to_word(r) for r in rows]
+
+    # ---------------- HINTS ----------------
+    def get_hints_left(self, user_id):
+        u = self.get_user(user_id)
+        if not u:
+            return 0
+        today = _today()
+        if u.get('hints_date') != today:
+            return DAILY_HINTS
+        return max(0, DAILY_HINTS - (u.get('hints_used') or 0))
+
+    def use_hint(self, user_id):
+        today = _today()
+        with self._conn() as conn:
+            u = conn.execute('SELECT hints_date, hints_used FROM users WHERE user_id=?',
+                             (user_id,)).fetchone()
+            if not u or u['hints_date'] != today:
+                conn.execute('UPDATE users SET hints_date=?, hints_used=1 WHERE user_id=?',
+                             (today, user_id))
+            else:
+                conn.execute('UPDATE users SET hints_used=hints_used+1 WHERE user_id=?',
+                             (user_id,))
 
     def batch_size_for(self, user_id):
         lvl = self.get_level(user_id) or 3
@@ -226,13 +320,13 @@ class Database:
                 conn.execute('''
                     INSERT INTO words
                     (user_id, word, transcription, translation, example1, example2,
-                     distractors_en, distractors_uk, batch_number, added_date)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                     distractors_en, distractors_uk, batch_number, added_date, cefr_level)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 ''', (user_id, wd['word'], wd['transcription'], wd['translation'],
                       wd['example1'], wd['example2'],
                       json.dumps(wd.get('distractors_en', []), ensure_ascii=False),
                       json.dumps(wd.get('distractors_uk', []), ensure_ascii=False),
-                      batch_num, today))
+                      batch_num, today, wd.get('cefr_level')))
                 count += 1
                 added += 1
         return added

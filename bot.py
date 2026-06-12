@@ -15,8 +15,10 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
-from database import Database, _now
-from claude_api import get_word_info, FALLBACK_DISTRACTORS
+from database import (
+    Database, _now, CEFR_LEVELS, CEFR_TARGET, CEFR_ADVANCE_AT, DAILY_HINTS
+)
+from claude_api import get_word_info, generate_cefr_word, FALLBACK_DISTRACTORS
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -40,6 +42,17 @@ TIMEZONES = {
     'Asia/Ho_Chi_Minh': '🇻🇳 Хошимін (UTC+7)',
     'Europe/Kiev': '🇺🇦 Київ (UTC+2/+3)',
 }
+
+CEFR_DESC = {
+    'A1': 'Початковий',
+    'A2': 'Базовий',
+    'B1': 'Середній',
+    'B2': 'Вище середнього',
+    'C1': 'Просунутий',
+    'C2': 'Досконалий',
+}
+LEVELUP_TEST_SIZE = 50
+LEVELUP_MAX_MISTAKES = 3
 
 REMINDERS = [
     (9, 0, 'morning'),
@@ -86,6 +99,15 @@ def translation_variants(translation):
     return [v.strip() for v in raw.split(',') if v.strip()]
 
 
+def _next_cefr(cefr):
+    """Наступний рівень CEFR або None якщо вже C2."""
+    try:
+        i = CEFR_LEVELS.index(cefr)
+        return CEFR_LEVELS[i + 1] if i + 1 < len(CEFR_LEVELS) else None
+    except (ValueError, IndexError):
+        return None
+
+
 # ============ KEYBOARDS ============
 def persistent_kb():
     return ReplyKeyboardMarkup(
@@ -94,14 +116,17 @@ def persistent_kb():
     )
 
 
-def main_menu_kb():
-    return InlineKeyboardMarkup([
+def main_menu_kb(user_id=None):
+    rows = [
         [InlineKeyboardButton('📚 Мої слова', callback_data='m:words:0'),
          InlineKeyboardButton('➕ Додати', callback_data='m:add')],
         [InlineKeyboardButton('📊 Статистика', callback_data='m:stats:today'),
          InlineKeyboardButton('🎯 Тест', callback_data='m:test')],
-        [InlineKeyboardButton('⚙️ Налаштування', callback_data='m:settings')],
-    ])
+    ]
+    if user_id is not None and db.get_word_source(user_id) == 'cefr':
+        rows.insert(1, [InlineKeyboardButton('🎓 Згенерувати нові слова', callback_data='cefr:gen')])
+    rows.append([InlineKeyboardButton('⚙️ Налаштування', callback_data='m:settings')])
+    return InlineKeyboardMarkup(rows)
 
 
 def back_kb(target='m:home'):
@@ -117,10 +142,59 @@ def test_menu_kb():
 
 
 # ============ ONBOARDING ============
+# Крок 1 — джерело слів
+def onboarding_source_text():
+    return (
+        '👋 <b>З чого почнемо?</b>\n' + DIV + '\n'
+        'Обери звідки брати слова для вивчення:\n\n'
+        '🎓 <b>За рівнем CEFR</b> — бот сам підбирає реальні вживані '
+        'слова твого рівня (A1–C2)\n\n'
+        '✍️ <b>Свої слова</b> — додаєш власні слова вручну'
+    )
+
+
+def onboarding_source_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🎓 За рівнем CEFR', callback_data='src:cefr')],
+        [InlineKeyboardButton('✍️ Свої слова', callback_data='src:own')],
+    ])
+
+
+# Крок 1.5 — вибір CEFR рівня
+def onboarding_cefr_text():
+    return (
+        '🎓 <b>Який твій рівень англійської?</b>\n' + DIV + '\n'
+        'Бот підбиратиме слова саме цього рівня:\n\n'
+        '🟢 <b>A1</b> — Початковий\n'
+        '🟢 <b>A2</b> — Базовий\n'
+        '🔵 <b>B1</b> — Середній\n'
+        '🔵 <b>B2</b> — Вище середнього\n'
+        '🟠 <b>C1</b> — Просунутий\n'
+        '🔴 <b>C2</b> — Досконалий\n\n'
+        'Не знаєш свій рівень? Почни з <b>A2</b> або <b>B1</b>.'
+    )
+
+
+def onboarding_cefr_kb():
+    emoji = {'A1': '🟢', 'A2': '🟢', 'B1': '🔵', 'B2': '🔵', 'C1': '🟠', 'C2': '🔴'}
+    rows = []
+    pair = []
+    for lvl in CEFR_LEVELS:
+        pair.append(InlineKeyboardButton(f'{emoji[lvl]} {lvl} — {CEFR_DESC[lvl]}',
+                                         callback_data=f'cefr:{lvl}'))
+        if len(pair) == 1:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    return InlineKeyboardMarkup(rows)
+
+
+# Крок 2 — рівень складності тесту
 def onboarding_text():
     return (
-        '🎚 <b>Обери рівень складності</b>\n' + DIV + '\n'
-        'Від рівня залежить розмір партії та тип тесту:\n\n'
+        '🎚 <b>Обери рівень складності тесту</b>\n' + DIV + '\n'
+        'Від нього залежить розмір партії та тип тесту:\n\n'
         '🟢 <b>Легкий</b> — 4 слова, вибір з 3 кнопок\n'
         '🔵 <b>Середній</b> — 7 слів, вибір з 5 кнопок\n'
         '🟠 <b>Складний</b> — 10 слів, вибір з 8 кнопок\n'
@@ -137,7 +211,29 @@ def onboarding_kb():
 
 
 async def needs_onboarding(user_id):
-    return db.get_level(user_id) is None
+    """Онбординг не завершено, якщо не обрано джерело, рівень CEFR (для cefr) або складність."""
+    src = db.get_word_source(user_id)
+    if src is None:
+        return True
+    if src == 'cefr' and db.get_cefr_level(user_id) is None:
+        return True
+    if db.get_level(user_id) is None:
+        return True
+    return False
+
+
+async def send_onboarding_step(message_or_chat, user_id, context=None, edit_query=None):
+    """Показує поточний потрібний крок онбордингу."""
+    src = db.get_word_source(user_id)
+    if src is None:
+        text, kb = onboarding_source_text(), onboarding_source_kb()
+    elif src == 'cefr' and db.get_cefr_level(user_id) is None:
+        text, kb = onboarding_cefr_text(), onboarding_cefr_kb()
+    else:
+        text, kb = onboarding_text(), onboarding_kb()
+    if edit_query is not None:
+        return await safe_edit(edit_query, text, kb)
+    await message_or_chat.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 # ============ RENDER: HOME ============
@@ -160,10 +256,21 @@ def render_home(user_id):
     streak = u['current_streak'] if u else 0
     best = u['best_streak'] if u else 0
 
+    src = db.get_word_source(user_id)
+    cefr = db.get_cefr_level(user_id)
+
     lines = [greet, '', DIV]
-    lines.append(f'{conf["emoji"]} Рівень: {conf["name"]} ({conf["desc"]})')
+    lines.append(f'{conf["emoji"]} Складність: {conf["name"]} ({conf["desc"]})')
+
+    if src == 'cefr' and cefr:
+        mastered = db.cefr_mastered_count(user_id, cefr)
+        lines.append(f'🎓 Рівень CEFR: {cefr} ({CEFR_DESC.get(cefr, "")})')
+        lines.append(f'📈 Вивчено: {mastered}/{CEFR_TARGET} слів рівня {cefr}')
+
     if batch_no:
         lines.append(f'📚 Партія #{batch_no} · {len(active)} слів')
+    elif src == 'cefr':
+        lines.append('🎓 Натисни «Згенерувати нові слова» щоб почати')
     else:
         lines.append('📭 Поки немає слів — натисни ➕ Додати')
 
@@ -180,7 +287,19 @@ def render_home(user_id):
         lines.append('😅 Повтори:')
         lines.append(', '.join(w['word'].upper() for w in weak))
 
-    return '\n'.join(lines), main_menu_kb()
+    kb_rows = list(main_menu_kb(user_id).inline_keyboard)
+    # Пропозиція тесту переходу, якщо вивчено достатньо
+    if src == 'cefr' and cefr:
+        mastered = db.cefr_mastered_count(user_id, cefr)
+        nxt = _next_cefr(cefr)
+        if mastered >= CEFR_ADVANCE_AT and nxt:
+            lines.append(DIV)
+            lines.append(f'🎉 Ти вивчив {mastered} слів рівня {cefr}!')
+            lines.append(f'Готовий перевірити себе для переходу на {nxt}?')
+            kb_rows.insert(0, [InlineKeyboardButton(
+                f'🎯 Тест переходу на {nxt}', callback_data='levelup:start')])
+
+    return '\n'.join(lines), InlineKeyboardMarkup(kb_rows)
 
 
 # ============ RENDER: WORD CARD ============
@@ -328,22 +447,35 @@ def render_settings(user_id):
     lvl = (u['level'] if u else None) or 3
     conf = LEVELS.get(lvl, LEVELS[3])
     paused = db.is_paused(user_id)
+    src = db.get_word_source(user_id)
+    cefr = db.get_cefr_level(user_id)
+
     text = ['⚙️ <b>Налаштування</b>', DIV]
-    text.append(f'{conf["emoji"]} Рівень: <b>{conf["name"]}</b> ({conf["desc"]})')
+    if src == 'cefr' and cefr:
+        mastered = db.cefr_mastered_count(user_id, cefr)
+        text.append(f'🎓 Джерело: рівень CEFR <b>{cefr}</b> ({CEFR_DESC.get(cefr, "")})')
+        text.append(f'📈 Вивчено: {mastered}/{CEFR_TARGET} слів рівня {cefr}')
+    else:
+        text.append('✍️ Джерело: <b>Свої слова</b>')
+    text.append(f'{conf["emoji"]} Складність: <b>{conf["name"]}</b> ({conf["desc"]})')
     text.append(DIV)
-    text.append('🕘 Нагадування (за Хошиміном):')
-    text.append('9:00 · 12:00 · 15:00 · 18:00 · 21:00')
-    text.append(DIV)
-    text.append('⏸ Пауза: ' + ('так, на паузі' if paused else 'вимкнено'))
 
     tz = db.get_timezone(user_id)
     tz_label = TIMEZONES.get(tz, tz)
     text.append(f'🕐 Час нагадувань: {tz_label}')
+    text.append('9:00 · 10:30 · 12:00 · 14:30 · 18:00 · 21:00')
+    text.append(DIV)
+    text.append('⏸ Пауза: ' + ('так, на паузі' if paused else 'вимкнено'))
 
     rows = [
-        [InlineKeyboardButton('🎚 Змінити рівень', callback_data='s:level')],
-        [InlineKeyboardButton('🕐 Змінити часовий пояс', callback_data='s:tz')],
+        [InlineKeyboardButton('🎚 Змінити складність', callback_data='s:level')],
     ]
+    if src == 'cefr':
+        rows.append([InlineKeyboardButton('🎓 Змінити рівень CEFR', callback_data='s:cefr')])
+        rows.append([InlineKeyboardButton('✍️ Перейти на свої слова', callback_data='s:src:own')])
+    else:
+        rows.append([InlineKeyboardButton('🎓 Перейти на рівні CEFR', callback_data='s:src:cefr')])
+    rows.append([InlineKeyboardButton('🕐 Змінити часовий пояс', callback_data='s:tz')])
     if paused:
         rows.append([InlineKeyboardButton('▶️ Зняти паузу', callback_data='s:unpause')])
     else:
@@ -382,6 +514,20 @@ def render_tz_picker(user_id):
     return '\n'.join(text), InlineKeyboardMarkup(rows)
 
 
+def render_cefr_setting_picker(user_id):
+    cur = db.get_cefr_level(user_id)
+    emoji = {'A1': '🟢', 'A2': '🟢', 'B1': '🔵', 'B2': '🔵', 'C1': '🟠', 'C2': '🔴'}
+    text = ['🎓 <b>Рівень CEFR</b>', DIV,
+            'Нові слова підбиратимуться за обраним рівнем.', '']
+    rows = []
+    for lvl in CEFR_LEVELS:
+        mark = ' ✅' if lvl == cur else ''
+        rows.append([InlineKeyboardButton(f'{emoji[lvl]} {lvl} — {CEFR_DESC[lvl]}{mark}',
+                                          callback_data=f'cefr:{lvl}')])
+    rows.append([InlineKeyboardButton('◀️ Назад', callback_data='m:settings')])
+    return '\n'.join(text), InlineKeyboardMarkup(rows)
+
+
 # ============ COMMANDS ============
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -393,9 +539,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'методом інтервального повторення.',
             reply_markup=persistent_kb()
         )
-        await update.message.reply_text(
-            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML
-        )
+        await send_onboarding_step(update.message, user.id, context)
         return
 
     await update.message.reply_text(
@@ -408,8 +552,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_user(update.effective_user.id, update.effective_user.first_name)
     if await needs_onboarding(update.effective_user.id):
-        await update.message.reply_text(
-            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+        await send_onboarding_step(update.message, update.effective_user.id, context)
         return
     if context.args:
         await process_new_words(update.effective_user.id, ' '.join(context.args),
@@ -425,8 +568,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await needs_onboarding(update.effective_user.id):
-        await update.message.reply_text(
-            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+        await send_onboarding_step(update.message, update.effective_user.id, context)
         return
     text, kb = render_home(update.effective_user.id)
     await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -468,7 +610,53 @@ async def process_new_words(user_id, raw_text, message, context):
     lines.append(f'Слова розбито на партії по {bsize}. Перша партія активна! 🚀')
 
     await status.edit_text('\n'.join(lines), parse_mode=ParseMode.HTML,
-                           reply_markup=main_menu_kb())
+                           reply_markup=main_menu_kb(user_id))
+
+
+# ============ CEFR GENERATION ============
+async def generate_cefr_batch(user_id, context, chat_id):
+    """Генерує партію слів поточного CEFR-рівня користувача."""
+    cefr = db.get_cefr_level(user_id)
+    if not cefr:
+        await context.bot.send_message(chat_id, 'Спочатку обери рівень CEFR в ⚙️ Налаштуваннях.')
+        return False
+
+    size = db.batch_size_for(user_id)
+    status = await context.bot.send_message(
+        chat_id, f'🎓 Генерую {size} слів рівня {cefr}... Це займе трохи часу ⏳')
+
+    exclude = [w.lower() for w in db.cefr_recent_words(user_id, cefr, 40)]
+    seen = set(exclude)
+    words_data = []
+    attempts = 0
+    max_attempts = size * 4
+
+    while len(words_data) < size and attempts < max_attempts:
+        attempts += 1
+        info = await generate_cefr_word(cefr, list(seen))
+        if not info:
+            continue
+        w = info['word'].lower()
+        if w in seen or db.word_exists(user_id, w):
+            continue
+        seen.add(w)
+        info['cefr_level'] = cefr
+        words_data.append(info)
+
+    if not words_data:
+        await status.edit_text('😕 Не вдалось згенерувати слова. Спробуй ще раз пізніше.')
+        return False
+
+    db.add_words(user_id, words_data, batch_size=size)
+
+    lines = [f'🎓 <b>Нова партія рівня {cefr}</b>', DIV]
+    for wd in words_data:
+        lines.append(f'• <b>{wd["word"].upper()}</b> 🔊 {wd["transcription"]} — {wd["translation"]}')
+    lines.append('')
+    lines.append('Партія активна! Починай тренуватись 🚀')
+    await status.edit_text('\n'.join(lines), parse_mode=ParseMode.HTML,
+                           reply_markup=main_menu_kb(user_id))
+    return True
 
 
 # ============ QUIZ ENGINE ============
@@ -553,6 +741,32 @@ async def start_quiz(user_id, kind, context, chat_id):
     return True
 
 
+async def start_levelup_test(user_id, context, chat_id):
+    """Тест переходу на наступний CEFR-рівень (до 50 слів, допуск 3 помилки)."""
+    cefr = db.get_cefr_level(user_id)
+    nxt = _next_cefr(cefr) if cefr else None
+    if not cefr or not nxt:
+        await context.bot.send_message(chat_id, 'Тест переходу зараз недоступний.')
+        return False
+    words = db.cefr_words_for_test(user_id, cefr, LEVELUP_TEST_SIZE)
+    if len(words) < 10:
+        await context.bot.send_message(
+            chat_id, f'Замало слів рівня {cefr} для тесту переходу. Повчись ще трохи 🎓')
+        return False
+    ids = [w['id'] for w in words]
+    random.shuffle(ids)
+    db.start_quiz(user_id, 'levelup', ids)
+    await context.bot.send_message(
+        chat_id,
+        f'🎯 <b>ТЕСТ ПЕРЕХОДУ {cefr} → {nxt}</b>\n{DIV}\n'
+        f'{len(ids)} слів · допускається до {LEVELUP_MAX_MISTAKES} помилок\n'
+        f'Готовий? Поїхали! 💪',
+        parse_mode=ParseMode.HTML
+    )
+    await present_question(user_id, context, chat_id)
+    return True
+
+
 async def present_question(user_id, context, chat_id):
     wid = db.quiz_next(user_id)
     if wid is None:
@@ -593,11 +807,17 @@ async def present_question(user_id, context, chat_id):
             flag, prompt, instr = '🇺🇦', w_full['translation'], 'Напиши англійською 👇'
         else:
             flag, prompt, instr = '🇬🇧', w_full['word'], 'Напиши переклад українською 👇'
+        kb = None
+        hints_left = db.get_hints_left(user_id)
+        if hints_left > 0:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                f'💡 Підказка ({hints_left}/{DAILY_HINTS})', callback_data='hint')]])
         await context.bot.send_message(
             chat_id,
             f'✍️ <b>{done}/{total}</b>\n{DIV}\n'
             f'{flag} <b>{prompt.upper()}</b>\n\n{instr}',
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
         )
 
 
@@ -648,6 +868,50 @@ async def handle_choice_answer(user_id, selected, context, chat_id, query):
         )
     await asyncio.sleep(0.4)
     await present_question(user_id, context, chat_id)
+
+
+async def handle_hint(user_id, context, chat_id, query):
+    """Показує перші 2 літери відповіді (режим Експерт), списує одну підказку."""
+    q = db.get_quiz(user_id)
+    if not q or not q['current_q'] or q['current_word_id'] is None:
+        await query.answer('Підказка зараз недоступна')
+        return
+    payload = q['current_q']
+    if payload.get('mode') != 'type':
+        await query.answer('Підказка лише для письмових питань')
+        return
+    if db.get_hints_left(user_id) <= 0:
+        await query.answer('Підказки на сьогодні закінчились 😔', show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    w = db.get_word_by_id(user_id, q['current_word_id'])
+    if not w:
+        return
+    direction = payload['direction']
+    target = w['word'] if direction == 'ua2en' else (translation_variants(w['translation']) or [w['translation']])[0]
+    target = (target or '').strip()
+    reveal = target[:2].upper() if len(target) >= 2 else target.upper()
+
+    db.use_hint(user_id)
+    left = db.get_hints_left(user_id)
+
+    await context.bot.send_message(
+        chat_id, f'💡 Починається на: <b>{reveal}...</b>', parse_mode=ParseMode.HTML)
+
+    # оновити кнопку лічильника або прибрати
+    try:
+        if left > 0:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    f'💡 Підказка ({left}/{DAILY_HINTS})', callback_data='hint')]]))
+        else:
+            await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 async def handle_type_answer(user_id, text, context, chat_id):
@@ -718,6 +982,26 @@ async def finish_quiz(user_id, context, chat_id):
 
     db.clear_quiz(user_id)
 
+    if kind == 'levelup':
+        cefr = db.get_cefr_level(user_id)
+        nxt = _next_cefr(cefr) if cefr else None
+        mistakes = total - correct
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f'✅ Перейти на {nxt}', callback_data='levelup:advance')],
+            [InlineKeyboardButton(f'↩️ Залишитись на {cefr}', callback_data='levelup:stay')],
+        ])
+        if mistakes <= LEVELUP_MAX_MISTAKES:
+            msg = (f'🎉 <b>Вітаю! {correct}/{total}</b>\n{DIV}\n'
+                   f'Помилок: {mistakes} — чудовий результат!\n'
+                   f'Ти готовий перейти на рівень <b>{nxt}</b> 🚀')
+        else:
+            msg = (f'📊 <b>{correct}/{total}</b>\n{DIV}\n'
+                   f'Помилок: {mistakes}. Рекомендую ще трохи підучити {cefr} '
+                   f'перед переходом 📚\n'
+                   f'Але якщо хочеш — можеш перейти на {nxt} вже зараз.')
+        await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
     if kind == 'official':
         if all_ok:
             nxt = db.unlock_next_batch(user_id)
@@ -725,10 +1009,16 @@ async def finish_quiz(user_id, context, chat_id):
                    f'Ти пройшов офіційний тест на 100%! 💪\n')
             if nxt:
                 msg += f'🔓 Розблоковано Партію #{nxt}!'
+                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
+                                               reply_markup=main_menu_kb(user_id))
+            elif db.get_word_source(user_id) == 'cefr':
+                msg += '🎓 Генерую наступну партію слів...'
+                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
+                await generate_cefr_batch(user_id, context, chat_id)
             else:
-                msg += '🏆 Це була остання партія — ти красавчик!'
-            await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
-                                           reply_markup=main_menu_kb())
+                msg += '🏆 Це була остання партія — ти красавчик!\nДодай нові слова через ➕ Додати.'
+                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
+                                               reply_markup=main_menu_kb(user_id))
         else:
             db.set_official_cooldown(user_id, 10)
             msg = (f'😅 <b>{correct}/{total}</b>\n{DIV}\n'
@@ -747,7 +1037,7 @@ async def finish_quiz(user_id, context, chat_id):
         else:
             msg += '🔥 Жодної помилки!'
         await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
-                                       reply_markup=main_menu_kb())
+                                       reply_markup=main_menu_kb(user_id))
 
 
 # ============ CALLBACK ROUTER ============
@@ -794,24 +1084,94 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ----- ONBOARDING level pick -----
+    # ----- ONBOARDING: джерело слів -----
+    if data == 'src:cefr':
+        db.set_word_source(user_id, 'cefr')
+        return await safe_edit(query, onboarding_cefr_text(), onboarding_cefr_kb())
+    if data == 'src:own':
+        db.set_word_source(user_id, 'own')
+        return await safe_edit(query, onboarding_text(), onboarding_kb())
+
+    # ----- ONBOARDING: вибір CEFR -----
+    if data.startswith('cefr:') and data != 'cefr:gen':
+        cefr = data.split(':')[1]
+        if cefr in CEFR_LEVELS:
+            db.set_cefr_level(user_id, cefr)
+            # якщо рівень складності ще не обрано — наступний крок
+            if db.get_level(user_id) is None:
+                return await safe_edit(query, onboarding_text(), onboarding_kb())
+            # інакше це зміна рівня з налаштувань
+            await query.answer(f'✅ Рівень CEFR: {cefr}')
+            text, kb = render_settings(user_id)
+            return await safe_edit(query, text, kb)
+        return
+
+    # ----- ONBOARDING: рівень складності -----
     if data.startswith('lvl:'):
         lvl = int(data.split(':')[1])
         db.set_level(user_id, lvl)
         conf = LEVELS[lvl]
+        src = db.get_word_source(user_id)
         await safe_edit(query,
-                        f'✅ Рівень: {conf["emoji"]} <b>{conf["name"]}</b> ({conf["desc"]})',
+                        f'✅ Складність: {conf["emoji"]} <b>{conf["name"]}</b> ({conf["desc"]})',
                         None)
-        await context.bot.send_message(
-            chat_id, 'Готово! Натисни ➕ Додати, щоб завантажити перші слова.',
-            reply_markup=persistent_kb())
-        text, kb = render_home(user_id)
-        await context.bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        if src == 'cefr':
+            await context.bot.send_message(chat_id, 'Готово! 🎓', reply_markup=persistent_kb())
+            # одразу генеруємо першу партію
+            await generate_cefr_batch(user_id, context, chat_id)
+        else:
+            await context.bot.send_message(
+                chat_id, 'Готово! Натисни ➕ Додати, щоб завантажити перші слова.',
+                reply_markup=persistent_kb())
+            text, kb = render_home(user_id)
+            await context.bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
     # якщо ще не пройшов онбординг — змусити
     if await needs_onboarding(user_id):
-        return await safe_edit(query, onboarding_text(), onboarding_kb())
+        return await send_onboarding_step(None, user_id, context, edit_query=query)
+
+    # ----- CEFR: згенерувати нову партію -----
+    if data == 'cefr:gen':
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await generate_cefr_batch(user_id, context, chat_id)
+        return
+
+    # ----- LEVEL-UP TEST -----
+    if data == 'levelup:start':
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await start_levelup_test(user_id, context, chat_id)
+        return
+    if data == 'levelup:advance':
+        cefr = db.get_cefr_level(user_id)
+        nxt = _next_cefr(cefr) if cefr else None
+        if nxt:
+            db.set_cefr_level(user_id, nxt)
+            await safe_edit(query,
+                            f'🚀 <b>Вітаю з переходом на {nxt}!</b>\n{DIV}\n'
+                            f'Генерую перші слова нового рівня...', None)
+            await generate_cefr_batch(user_id, context, chat_id)
+        else:
+            await safe_edit(query, '🏆 Ти вже на максимальному рівні C2!', None)
+        return
+    if data == 'levelup:stay':
+        cefr = db.get_cefr_level(user_id)
+        await safe_edit(query,
+                        f'👍 Залишаємось на {cefr}. Продовжуй вчитись!', None)
+        text, kb = render_home(user_id)
+        await context.bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    # ----- HINT (режим Експерт) -----
+    if data == 'hint':
+        await handle_hint(user_id, context, chat_id, query)
+        return
 
     # ----- QUIZ choice answer -----
     if data.startswith('qa:'):
@@ -921,6 +1281,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 's:tz':
         text, kb = render_tz_picker(user_id)
         return await safe_edit(query, text, kb)
+    if data == 's:cefr':
+        text, kb = render_cefr_setting_picker(user_id)
+        return await safe_edit(query, text, kb)
+    if data == 's:src:cefr':
+        db.set_word_source(user_id, 'cefr')
+        if db.get_cefr_level(user_id) is None:
+            text, kb = render_cefr_setting_picker(user_id)
+            return await safe_edit(query, text, kb)
+        await query.answer('✅ Режим CEFR')
+        text, kb = render_settings(user_id)
+        return await safe_edit(query, text, kb)
+    if data == 's:src:own':
+        db.set_word_source(user_id, 'own')
+        await query.answer('✅ Свої слова')
+        text, kb = render_settings(user_id)
+        return await safe_edit(query, text, kb)
     if data.startswith('settz:'):
         tz = data.split(':', 1)[1]
         if tz in TIMEZONES:
@@ -970,14 +1346,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Постійні кнопки внизу
     if text == '📚 Меню':
         if await needs_onboarding(user_id):
-            return await update.message.reply_text(
-                onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+            return await send_onboarding_step(update.message, user_id, context)
         home, kb = render_home(user_id)
         return await update.message.reply_text(home, reply_markup=kb, parse_mode=ParseMode.HTML)
     if text == '🎯 Тест':
         if await needs_onboarding(user_id):
-            return await update.message.reply_text(
-                onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+            return await send_onboarding_step(update.message, user_id, context)
         return await update.message.reply_text(
             f'🎯 <b>Тести</b>\n{DIV}\n'
             f'🎯 <b>Тренування</b> — будь-коли\n'
@@ -985,8 +1359,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=test_menu_kb(), parse_mode=ParseMode.HTML)
 
     if await needs_onboarding(user_id):
-        return await update.message.reply_text(
-            onboarding_text(), reply_markup=onboarding_kb(), parse_mode=ParseMode.HTML)
+        return await send_onboarding_step(update.message, user_id, context)
 
     # Активний тест?
     q = db.get_quiz(user_id)
