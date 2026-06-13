@@ -21,6 +21,77 @@ FALLBACK_DISTRACTORS = [
 ]
 
 
+async def _call_claude(prompt: str, max_tokens: int) -> str:
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': CLAUDE_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': MODEL,
+                'max_tokens': max_tokens,
+                'messages': [{'role': 'user', 'content': prompt}],
+            },
+        )
+        data = resp.json()
+        text = data['content'][0]['text'].strip()
+        return text.replace('```json', '').replace('```', '').strip()
+
+
+async def _validate_distractors(word: str, translation: str, distractors: list) -> list:
+    """Друга перевірка: чи якийсь дистрактор є прийнятним перекладом/синонімом
+    правильного перекладу. Повертає список булевих флагів is_bad (True = замінити)."""
+    if not distractors:
+        return []
+
+    items = '\n'.join(
+        f'{i+1}. "{d["en"]}" -> "{d["uk"]}"' for i, d in enumerate(distractors)
+    )
+
+    prompt = f"""Слово: "{word}", правильний переклад: "{translation}".
+
+Ось 8 варіантів-обманок (дистракторів) для тесту з перекладом:
+{items}
+
+Завдання: перевір КОЖНУ uk-пару. Якщо студент обере цей варіант замість "{translation}",
+чи буде це ТЕХНІЧНО ТАКОЖ ПРАВИЛЬНОЮ відповіддю (синонім, взаємозамінний переклад,
+або занадто близьке значення до "{translation}")?
+
+Відповідай ВИКЛЮЧНО JSON-масивом з 8 булевих значень, без пояснень:
+[true/false, ... 8 елементів]
+true = цей варіант теж був би прийнятним перекладом "{word}" (ПОГАНО, треба замінити)
+false = цей варіант чітко неправильний для "{word}" (ДОБРЕ, лишити)"""
+
+    try:
+        text = await _call_claude(prompt, 200)
+        flags = json.loads(text)
+        if isinstance(flags, list) and len(flags) == len(distractors):
+            return [bool(f) for f in flags]
+    except Exception:
+        pass
+    return [False] * len(distractors)
+
+
+def _fill_replacements(clean: list, seen: set, word: str, bad_flags: list) -> list:
+    """Замінює дистрактори, позначені як 'bad', на запасні з FALLBACK_DISTRACTORS."""
+    result = []
+    fb_iter = iter(d for d in FALLBACK_DISTRACTORS if d['en'] not in seen and d['en'] != word)
+    for d, is_bad in zip(clean, bad_flags + [False] * (len(clean) - len(bad_flags))):
+        if is_bad:
+            try:
+                fb = next(fb_iter)
+                seen.add(fb['en'])
+                result.append(fb)
+                continue
+            except StopIteration:
+                pass
+        result.append(d)
+    return result
+
+
 async def get_word_info(word: str) -> dict:
     prompt = f"""Дай інформацію про англійське слово "{word}" у форматі JSON.
 
@@ -63,56 +134,48 @@ async def get_word_info(word: str) -> dict:
 - Всі 8 унікальні"""
 
     try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            resp = await client.post(
-                'https://api.anthropic.com/v1/messages',
-                headers={
-                    'x-api-key': CLAUDE_API_KEY,
-                    'anthropic-version': '2023-06-01',
-                    'content-type': 'application/json',
-                },
-                json={
-                    'model': MODEL,
-                    'max_tokens': 700,
-                    'messages': [{'role': 'user', 'content': prompt}],
-                },
-            )
-            data = resp.json()
-            text = data['content'][0]['text'].strip()
-            text = text.replace('```json', '').replace('```', '').strip()
-            info = json.loads(text)
+        text = await _call_claude(prompt, 700)
+        info = json.loads(text)
 
-            distractors = info.get('distractors', []) or []
-            clean = []
-            seen = set()
-            for d in distractors:
-                if not isinstance(d, dict):
-                    continue
-                en = str(d.get('en', '')).strip().lower()
-                uk = str(d.get('uk', '')).strip()
-                if not en or not uk:
-                    continue
-                if en == word.strip().lower() or en in seen:
-                    continue
-                seen.add(en)
-                clean.append({'en': en, 'uk': uk})
-            if len(clean) < 8:
-                for fb in FALLBACK_DISTRACTORS:
-                    if fb['en'] not in seen and fb['en'] != word.strip().lower():
-                        clean.append(fb)
-                        seen.add(fb['en'])
-                    if len(clean) >= 8:
-                        break
+        distractors = info.get('distractors', []) or []
+        clean = []
+        seen = set()
+        for d in distractors:
+            if not isinstance(d, dict):
+                continue
+            en = str(d.get('en', '')).strip().lower()
+            uk = str(d.get('uk', '')).strip()
+            if not en or not uk:
+                continue
+            if en == word.strip().lower() or en in seen:
+                continue
+            seen.add(en)
+            clean.append({'en': en, 'uk': uk})
+        if len(clean) < 8:
+            for fb in FALLBACK_DISTRACTORS:
+                if fb['en'] not in seen and fb['en'] != word.strip().lower():
+                    clean.append(fb)
+                    seen.add(fb['en'])
+                if len(clean) >= 8:
+                    break
 
-            return {
-                'word': word.strip().lower(),
-                'transcription': info.get('transcription', word.upper()),
-                'translation': info.get('translation', '—'),
-                'example1': info.get('example1', f'I use the word {word} often.'),
-                'example2': info.get('example2', f'She learned the word {word}.'),
-                'distractors_en': [d['en'] for d in clean[:8]],
-                'distractors_uk': [d['uk'] for d in clean[:8]],
-            }
+        clean = clean[:8]
+        translation = info.get('translation', '—')
+
+        # Другий прохід: перевірка дистракторів на синонімічність з перекладом
+        bad_flags = await _validate_distractors(word, translation, clean)
+        if any(bad_flags):
+            clean = _fill_replacements(clean, seen, word.strip().lower(), bad_flags)
+
+        return {
+            'word': word.strip().lower(),
+            'transcription': info.get('transcription', word.upper()),
+            'translation': translation,
+            'example1': info.get('example1', f'I use the word {word} often.'),
+            'example2': info.get('example2', f'She learned the word {word}.'),
+            'distractors_en': [d['en'] for d in clean[:8]],
+            'distractors_uk': [d['uk'] for d in clean[:8]],
+        }
     except Exception:
         return {
             'word': word.strip().lower(),
@@ -177,62 +240,54 @@ async def generate_cefr_word(cefr_level: str, exclude_words: list) -> dict:
   Приклад ПОМИЛКИ для bliss (блаженство): "rapture" -> "захоплення", "reverie" -> "задума" —
   це синоніми блаженства, всі звучали б "правильно" — НЕ РОБИ ТАК.
   Інший приклад: persistent (наполегливий) -> НЕ "впертий", НЕ "послідовний" (синоніми).
-  Замість цього бери слова з ІНШОЇ семантичної категорії, не пов'+"'"+'язаної зі значенням слова.
+  Замість цього бери слова з ІНШОЇ семантичної категорії, не пов'язаної зі значенням слова.
 - uk: ЗМІШАНА довжина (деякі 1 слово, деякі 2-3) щоб правильна відповідь не виділялась
 - Всі унікальні, жодне не дорівнює основному слову"""
 
     try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            resp = await client.post(
-                'https://api.anthropic.com/v1/messages',
-                headers={
-                    'x-api-key': CLAUDE_API_KEY,
-                    'anthropic-version': '2023-06-01',
-                    'content-type': 'application/json',
-                },
-                json={
-                    'model': MODEL,
-                    'max_tokens': 800,
-                    'messages': [{'role': 'user', 'content': prompt}],
-                },
-            )
-            data = resp.json()
-            text = data['content'][0]['text'].strip()
-            text = text.replace('```json', '').replace('```', '').strip()
-            info = json.loads(text)
+        text = await _call_claude(prompt, 800)
+        info = json.loads(text)
 
-            word = str(info.get('word', '')).strip().lower()
-            if not word or ' ' in word:
-                return None
+        word = str(info.get('word', '')).strip().lower()
+        if not word or ' ' in word:
+            return None
 
-            distractors = info.get('distractors', []) or []
-            clean = []
-            seen = set()
-            for d in distractors:
-                if not isinstance(d, dict):
-                    continue
-                en = str(d.get('en', '')).strip().lower()
-                uk = str(d.get('uk', '')).strip()
-                if not en or not uk or en == word or en in seen:
-                    continue
-                seen.add(en)
-                clean.append({'en': en, 'uk': uk})
-            if len(clean) < 8:
-                for fb in FALLBACK_DISTRACTORS:
-                    if fb['en'] not in seen and fb['en'] != word:
-                        clean.append(fb)
-                        seen.add(fb['en'])
-                    if len(clean) >= 8:
-                        break
+        distractors = info.get('distractors', []) or []
+        clean = []
+        seen = set()
+        for d in distractors:
+            if not isinstance(d, dict):
+                continue
+            en = str(d.get('en', '')).strip().lower()
+            uk = str(d.get('uk', '')).strip()
+            if not en or not uk or en == word or en in seen:
+                continue
+            seen.add(en)
+            clean.append({'en': en, 'uk': uk})
+        if len(clean) < 8:
+            for fb in FALLBACK_DISTRACTORS:
+                if fb['en'] not in seen and fb['en'] != word:
+                    clean.append(fb)
+                    seen.add(fb['en'])
+                if len(clean) >= 8:
+                    break
 
-            return {
-                'word': word,
-                'transcription': info.get('transcription', word.upper()),
-                'translation': info.get('translation', '—'),
-                'example1': info.get('example1', f'I use the word {word} often.'),
-                'example2': info.get('example2', f'She learned the word {word}.'),
-                'distractors_en': [d['en'] for d in clean[:8]],
-                'distractors_uk': [d['uk'] for d in clean[:8]],
-            }
+        clean = clean[:8]
+        translation = info.get('translation', '—')
+
+        # Другий прохід: перевірка дистракторів на синонімічність з перекладом
+        bad_flags = await _validate_distractors(word, translation, clean)
+        if any(bad_flags):
+            clean = _fill_replacements(clean, seen, word, bad_flags)
+
+        return {
+            'word': word,
+            'transcription': info.get('transcription', word.upper()),
+            'translation': translation,
+            'example1': info.get('example1', f'I use the word {word} often.'),
+            'example2': info.get('example2', f'She learned the word {word}.'),
+            'distractors_en': [d['en'] for d in clean[:8]],
+            'distractors_uk': [d['uk'] for d in clean[:8]],
+        }
     except Exception:
         return None
