@@ -727,10 +727,65 @@ async def generate_cefr_batch(user_id, context, chat_id):
 
 
 # ============ QUIZ ENGINE ============
-def build_question(user_id, w, level):
+def _make_gap(sentence, word):
+    """Замінює слово (або його форму) на ___ в реченні."""
+    import re
+    pattern = re.compile(re.escape(word), re.IGNORECASE)
+    result = pattern.sub('___', sentence, count=1)
+    if result == sentence:
+        result = sentence + ' (___)'
+    return result
+
+
+def build_question(user_id, w, level, gap=False):
     conf = LEVELS[level]
+    payload = {'word_id': w['id']}
+
+    if gap:
+        # Gap-режим: вгадуємо слово за реченням з пропуском,
+        # без транскрипції, кнопки за рівнем складності
+        sentence = w.get('example1') or w.get('example2') or w['word']
+        gapped = _make_gap(sentence, w['word'])
+        payload['sentence'] = gapped
+
+        if conf['mode'] == 'type':
+            payload['mode'] = 'gap_type'
+            return payload
+
+        nbtn = conf['buttons']
+        correct = w['word']
+        pool = list(w.get('distractors_en', []) or [])
+        fallback = [d['en'] for d in FALLBACK_DISTRACTORS]
+
+        seen = {_norm(correct)}
+        uniq = []
+        for d in pool:
+            if _norm(d) and _norm(d) not in seen:
+                seen.add(_norm(d))
+                uniq.append(d)
+        random.shuffle(uniq)
+
+        need = nbtn - 1
+        chosen = uniq[:need]
+        if len(chosen) < need:
+            fb = [d for d in fallback if _norm(d) not in seen]
+            random.shuffle(fb)
+            for d in fb:
+                chosen.append(d)
+                seen.add(_norm(d))
+                if len(chosen) >= need:
+                    break
+
+        options = chosen + [correct]
+        random.shuffle(options)
+        correct_index = options.index(correct)
+        payload.update({'mode': 'gap_choice', 'options': options,
+                        'correct_index': correct_index})
+        return payload
+
     direction = random.choice(['ua2en', 'en2uk'])
-    payload = {'word_id': w['id'], 'direction': direction, 'mode': conf['mode']}
+    payload['direction'] = direction
+    payload['mode'] = conf['mode']
 
     if conf['mode'] == 'type':
         return payload
@@ -844,15 +899,37 @@ async def present_question(user_id, context, chat_id):
         await present_question(user_id, context, chat_id)
         return
 
+    q = db.get_quiz(user_id)
     lvl = db.get_level(user_id) or 3
-    payload = build_question(user_id, w, lvl)
+    gap = (q is not None and q['kind'] == 'gap')
+    payload = build_question(user_id, w, lvl, gap=gap)
     db.set_current_question(user_id, payload)
 
     q = db.get_quiz(user_id)
     done = q['total'] - len(q['remaining'])
     total = q['total']
 
-    if payload['mode'] == 'choice':
+    if payload['mode'] == 'gap_choice':
+        rows = []
+        for i, opt in enumerate(payload['options']):
+            rows.append([InlineKeyboardButton(opt, callback_data=f'qa:{i}')])
+        await context.bot.send_message(
+            chat_id,
+            f'❓ <b>{done}/{total}</b>\n{DIV}\n'
+            f'🇬🇧 <i>{payload["sentence"]}</i>\n\n'
+            f'Обери слово, що пропущене 👇',
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+    elif payload['mode'] == 'gap_type':
+        await context.bot.send_message(
+            chat_id,
+            f'✍️ <b>{done}/{total}</b>\n{DIV}\n'
+            f'🇬🇧 <i>{payload["sentence"]}</i>\n\n'
+            f'Напиши пропущене слово англійською 👇',
+            parse_mode=ParseMode.HTML
+        )
+    elif payload['mode'] == 'choice':
         flag = payload['flag']
         prompt = payload['prompt']
         rows = []
@@ -893,7 +970,7 @@ async def handle_choice_answer(user_id, selected, context, chat_id, query):
     if not q or not q['current_q'] or q['current_word_id'] is None:
         return
     payload = q['current_q']
-    if payload.get('mode') != 'choice':
+    if payload.get('mode') not in ('choice', 'gap_choice'):
         return
     w = db.get_word_by_id(user_id, q['current_word_id'])
     if not w:
@@ -914,6 +991,27 @@ async def handle_choice_answer(user_id, selected, context, chat_id, query):
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+    if payload.get('mode') == 'gap_choice':
+        if correct:
+            await context.bot.send_message(
+                chat_id,
+                f'✅ Правильно!\n'
+                f'<b>{w["word"].upper()}</b> {w["translation"]} · 🔊 {w["transcription"]}',
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f'❌ Не вгадав.\n'
+                f'Ти обрав: <s>{chosen_text}</s>\n'
+                f'✅ Правильно: <b>{w["word"].upper()}</b>\n'
+                f'{w["translation"]} · 🔊 {w["transcription"]}',
+                parse_mode=ParseMode.HTML
+            )
+        await asyncio.sleep(0.4)
+        await present_question(user_id, context, chat_id)
+        return
 
     if correct:
         await context.bot.send_message(
@@ -986,13 +1084,39 @@ async def handle_type_answer(user_id, text, context, chat_id):
     if not q or not q['current_q'] or q['current_word_id'] is None:
         return False
     payload = q['current_q']
-    if payload.get('mode') != 'type':
+    if payload.get('mode') not in ('type', 'gap_type'):
         return False
     w = db.get_word_by_id(user_id, q['current_word_id'])
     if not w:
         return False
 
     answer = text.strip()
+
+    if payload.get('mode') == 'gap_type':
+        correct = type_is_correct(answer, w['word'])
+        db.record_answer(user_id, w['id'], correct,
+                         user_typed=None if correct else answer)
+        db.quiz_record(user_id, correct)
+        if correct:
+            await context.bot.send_message(
+                chat_id,
+                f'✅ Правильно!\n'
+                f'<b>{w["word"].upper()}</b> {w["translation"]} · 🔊 {w["transcription"]}',
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f'❌ Майже!\n'
+                f'Ти написав: <s>{answer}</s>\n'
+                f'✅ Правильно: <b>{w["word"].upper()}</b>\n'
+                f'{w["translation"]} · 🔊 {w["transcription"]}',
+                parse_mode=ParseMode.HTML
+            )
+        await asyncio.sleep(0.4)
+        await present_question(user_id, context, chat_id)
+        return True
+
     direction = payload['direction']
     if direction == 'ua2en':
         correct = type_is_correct(answer, w['word'])
@@ -1100,6 +1224,15 @@ async def finish_quiz(user_id, context, chat_id):
                 [InlineKeyboardButton('◀️ Меню', callback_data='m:home')],
             ])
             await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif kind == 'gap':
+        pct = round(correct / total * 100) if total else 0
+        msg = f'✏️ <b>Речення з пропуском — завершено</b>\n{DIV}\n✅ {correct}/{total} ({pct}%)\n'
+        if wrong_words:
+            msg += f'😅 Повтори: {", ".join(wrong_words)}'
+        else:
+            msg += '🔥 Жодної помилки!'
+        await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
+                                       reply_markup=main_menu_kb(user_id))
     else:
         pct = round(correct / total * 100) if total else 0
         msg = f'🎯 <b>Тренування завершено</b>\n{DIV}\n✅ {correct}/{total} ({pct}%)\n'
@@ -1122,37 +1255,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_user(user_id, query.from_user.first_name)
 
     if data == 'noop':
-        return
-
-    # Gap quiz answer
-    if data.startswith('gap:'):
-        parts = data.split(':')
-        # gap:{uid}:{word_id}:{correct_index}:{selected}
-        correct_index = int(parts[3])
-        selected = int(parts[4])
-        word_id = int(parts[2])
-        w = db.get_word_by_id(user_id, word_id)
-        correct = (selected == correct_index)
-        if w:
-            db.record_answer(user_id, w['id'], correct)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        if correct:
-            await context.bot.send_message(
-                chat_id,
-                f'✅ Правильно!\n'
-                f'<b>{w["word"].upper()}</b> {w["translation"]} · 🔊 {w["transcription"]}' if w else '✅ Правильно!',
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await context.bot.send_message(
-                chat_id,
-                f'❌ Неправильно. Правильна відповідь: <b>{w["word"].upper()}</b>\n'
-                f'{w["translation"]} · 🔊 {w["transcription"]}' if w else '❌ Неправильно.',
-                parse_mode=ParseMode.HTML
-            )
         return
 
     # ----- ONBOARDING: джерело слів -----
@@ -1466,7 +1568,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Активний тест?
     q = db.get_quiz(user_id)
     if q and q['current_q'] and q['current_word_id'] is not None:
-        if q['current_q'].get('mode') == 'type':
+        if q['current_q'].get('mode') in ('type', 'gap_type'):
             handled = await handle_type_answer(user_id, text, context, chat_id)
             if handled:
                 return
@@ -1503,12 +1605,22 @@ async def start_quiz_words(user_id, kind, word_list, context, chat_id):
     db.start_quiz(user_id, kind, ids)
     lvl = db.get_level(user_id) or 3
     conf = LEVELS[lvl]
-    mode_hint = ('обирай кнопкою' if conf['mode'] == 'choice' else 'пиши вручну')
-    await context.bot.send_message(
-        chat_id,
-        f'🎯 <b>Тренування</b>\n{DIV}\n{len(ids)} слів · {mode_hint} 💪',
-        parse_mode=ParseMode.HTML
-    )
+
+    if kind == 'gap':
+        mode_hint = 'обирай кнопкою' if conf['mode'] == 'choice' else 'пиши слово вручну'
+        await context.bot.send_message(
+            chat_id,
+            f'✏️ <b>Речення з пропуском</b>\n{DIV}\n'
+            f'{len(ids)} речень · {mode_hint} 👇',
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        mode_hint = ('обирай кнопкою' if conf['mode'] == 'choice' else 'пиши вручну')
+        await context.bot.send_message(
+            chat_id,
+            f'🎯 <b>Тренування</b>\n{DIV}\n{len(ids)} слів · {mode_hint} 💪',
+            parse_mode=ParseMode.HTML
+        )
     await present_question(user_id, context, chat_id)
     return True
 
@@ -1566,10 +1678,11 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 await start_quiz_words(uid, 'training', adaptive, context, uid)
 
             elif kind == 'gap':
-                # 14:30 — речення з пропуском
+                # 14:30 — речення з пропуском по всіх словах активної партії, послідовно (квіз)
+                db.clear_quiz(uid)
                 gap_words = words.copy()
                 random.shuffle(gap_words)
-                await _send_gap_quiz(uid, gap_words, context)
+                await start_quiz_words(uid, 'gap', gap_words, context, uid)
 
             elif kind == 'official':
                 await context.bot.send_message(
@@ -1583,50 +1696,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             logger.error(f'reminder {kind} for {uid}: {e}')
-
-
-async def _send_gap_quiz(user_id, words, context):
-    """14:30 — речення з пропуском для кожного слова."""
-    lvl = db.get_level(user_id) or 3
-    conf = LEVELS[lvl]
-    nbtn = min(conf['buttons'], 4) if conf['mode'] == 'choice' else 4  # макс 4 кнопки для gap
-
-    lines = [f'✏️ <b>Речення з пропуском</b>\n{DIV}\nВстав правильне слово 👇']
-    await context.bot.send_message(user_id, '\n'.join(lines), parse_mode=ParseMode.HTML)
-
-    for w in words[:min(len(words), 5)]:  # максимум 5 речень
-        # Замінюємо слово в реченні на ___
-        sentence = w['example1']
-        gapped = _make_gap(sentence, w['word'])
-
-        # Варіанти: правильне + дистрактори
-        pool = list(w.get('distractors_en', []) or [])
-        random.shuffle(pool)
-        options = pool[:nbtn - 1] + [w['word']]
-        random.shuffle(options)
-        correct_index = options.index(w['word'])
-
-        rows = [[InlineKeyboardButton(opt, callback_data=f'gap:{user_id}:{w["id"]}:{correct_index}:{i}')]
-                for i, opt in enumerate(options)]
-
-        await context.bot.send_message(
-            user_id,
-            f'🇬🇧 <i>{gapped}</i>\n\n'
-            f'{w["translation"]} · 🔊 {w["transcription"]}',
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
-        await asyncio.sleep(0.3)
-
-
-def _make_gap(sentence, word):
-    """Замінює слово (або його форму) на ___ в реченні."""
-    import re
-    pattern = re.compile(re.escape(word), re.IGNORECASE)
-    result = pattern.sub('___', sentence, count=1)
-    if result == sentence:
-        result = sentence + ' (___)'
-    return result
 
 
 async def post_init(application: Application):
