@@ -556,40 +556,53 @@ class Database:
             return 0
 
     # ---------------- QUIZ SESSION ----------------
-    def start_quiz(self, user_id, kind, word_ids):
+    def start_quiz(self, user_id, kind, tasks):
+        """tasks — список задач. Кожна задача: int (word_id, випадковий напрямок)
+        або [word_id, direction] (примусовий напрямок: 'ua2en'/'en2uk')."""
         with self._conn() as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO quiz_session
                 (user_id, kind, remaining, total, current_word_id, current_q, results)
                 VALUES (?,?,?,?,?,?,?)
-            ''', (user_id, kind, json.dumps(word_ids), len(word_ids), None, None, json.dumps({})))
+            ''', (user_id, kind, json.dumps(tasks), len(tasks), None, None, json.dumps([])))
 
     def get_quiz(self, user_id):
         with self._conn() as conn:
             r = conn.execute('SELECT * FROM quiz_session WHERE user_id=?', (user_id,)).fetchone()
             if not r:
                 return None
+            results = json.loads(r['results']) if r['results'] else []
+            # сумісність зі старим форматом (dict) якщо лишилась незавершена сесія
+            if isinstance(results, dict):
+                results = [[int(k), bool(v)] for k, v in results.items()]
             return {
                 'kind': r['kind'],
                 'remaining': json.loads(r['remaining']) if r['remaining'] else [],
                 'total': r['total'],
                 'current_word_id': r['current_word_id'],
                 'current_q': json.loads(r['current_q']) if r['current_q'] else None,
-                'results': json.loads(r['results']) if r['results'] else {},
+                'results': results,
             }
 
     def quiz_next(self, user_id):
+        """Повертає (word_id, forced_direction) або None. forced_direction може бути None."""
         q = self.get_quiz(user_id)
         if not q or not q['remaining']:
             return None
         nxt = q['remaining'][0]
         rest = q['remaining'][1:]
+        if isinstance(nxt, (list, tuple)):
+            wid = int(nxt[0])
+            forced_dir = nxt[1] if len(nxt) > 1 else None
+        else:
+            wid = int(nxt)
+            forced_dir = None
         with self._conn() as conn:
             conn.execute(
                 'UPDATE quiz_session SET remaining=?, current_word_id=?, current_q=NULL WHERE user_id=?',
-                (json.dumps(rest), nxt, user_id)
+                (json.dumps(rest), wid, user_id)
             )
-        return nxt
+        return (wid, forced_dir)
 
     def set_current_question(self, user_id, payload):
         with self._conn() as conn:
@@ -601,7 +614,7 @@ class Database:
         if not q or q['current_word_id'] is None:
             return
         results = q['results']
-        results[str(q['current_word_id'])] = bool(correct)
+        results.append([int(q['current_word_id']), bool(correct)])
         with self._conn() as conn:
             conn.execute('UPDATE quiz_session SET results=? WHERE user_id=?',
                          (json.dumps(results), user_id))
@@ -610,7 +623,8 @@ class Database:
         q = self.get_quiz(user_id)
         if not q:
             return False
-        return len(q['results']) == q['total'] and all(q['results'].values())
+        results = q['results']
+        return len(results) == q['total'] and all(ok for _, ok in results)
 
     def clear_quiz(self, user_id):
         with self._conn() as conn:
