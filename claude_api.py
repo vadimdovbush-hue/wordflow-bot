@@ -157,6 +157,89 @@ async def regenerate_distractors(word: str, translation: str) -> dict:
         return None
 
 
+async def get_word_info_fixed(word: str, translation: str) -> dict:
+    """Як get_word_info, але переклад ЗАДАНО вручну (для багатозначних слів,
+    напр. waste -> 'марнувати, витрачати'). Генерує транскрипцію, приклади та
+    дистрактори саме під це значення."""
+    word = word.strip().lower()
+    translation = translation.strip()
+    prompt = f"""Англійське слово "{word}" вивчається САМЕ у значенні "{translation}" (українською).
+Дай інформацію у форматі JSON. ВАЖЛИВО: усе має стосуватись значення "{translation}",
+а НЕ інших значень слова "{word}".
+
+Відповідай ВИКЛЮЧНО валідним JSON без пояснень і без markdown:
+{{
+  "transcription": "транскрипція українськими буквами, наголошений склад ВЕЛИКИМИ (напр. waste→ВЕЙСТ)",
+  "example1": "просте англійське речення, де \"{word}\" вжите саме у значенні \"{translation}\"",
+  "example2": "інше англійське речення з \"{word}\" у значенні \"{translation}\", інший контекст",
+  "distractors": [
+    {{"en": "англ. слово-обманка рівня B2-C1", "uk": "переклад 1-3 слова"}},
+    ... РІВНО 8 таких пар ...
+  ]
+}}
+
+Правила прикладів:
+- ОБОВ'ЯЗКОВО вжити "{word}" у значенні "{translation}" (а не в іншому значенні)
+
+Правила distractors (варіанти-обманки):
+- РІВНО 8 пар, англійські слова рівня B2-C1, правдоподібні
+- КРИТИЧНО: з ЯВНО ІНШИМ значенням, НЕ синоніми і НЕ з тієї ж теми, що "{translation}".
+  Тест працює у два боки, тому НІ англійське слово, НІ його укр-переклад не можуть бути
+  близькими до "{word}"/"{translation}".
+- uk переклад: ЗМІШАНА довжина (деякі 1 слово, деякі 2-3)
+- Жодне en не дорівнює "{word}", жодна uk не дорівнює "{translation}"
+- Всі 8 унікальні"""
+
+    try:
+        text = await _call_claude(prompt, 700)
+        info = json.loads(text)
+
+        distractors = info.get('distractors', []) or []
+        clean = []
+        seen = {word, translation.lower()}
+        for d in distractors:
+            if not isinstance(d, dict):
+                continue
+            en = str(d.get('en', '')).strip().lower()
+            uk = str(d.get('uk', '')).strip()
+            if not en or not uk or en in seen:
+                continue
+            seen.add(en)
+            clean.append({'en': en, 'uk': uk})
+        if len(clean) < 8:
+            for fb in FALLBACK_DISTRACTORS:
+                if fb['en'] not in seen:
+                    clean.append(fb)
+                    seen.add(fb['en'])
+                if len(clean) >= 8:
+                    break
+        clean = clean[:8]
+
+        bad = await _validate_distractors(word, translation, clean)
+        if any(bad):
+            clean = _fill_replacements(clean, seen, word, bad)
+
+        return {
+            'word': word,
+            'transcription': info.get('transcription', word.upper()),
+            'translation': translation,
+            'example1': info.get('example1', f'I use the word {word} often.'),
+            'example2': info.get('example2', f'She learned the word {word}.'),
+            'distractors_en': [d['en'] for d in clean[:8]],
+            'distractors_uk': [d['uk'] for d in clean[:8]],
+        }
+    except Exception:
+        return {
+            'word': word,
+            'transcription': word.upper(),
+            'translation': translation,
+            'example1': f'I use the word {word} often.',
+            'example2': f'She learned the word {word}.',
+            'distractors_en': [d['en'] for d in FALLBACK_DISTRACTORS[:8]],
+            'distractors_uk': [d['uk'] for d in FALLBACK_DISTRACTORS[:8]],
+        }
+
+
 async def get_word_info(word: str) -> dict:
     prompt = f"""Дай інформацію про англійське слово "{word}" у форматі JSON.
 
@@ -176,6 +259,10 @@ async def get_word_info(word: str) -> dict:
 - МАКСИМУМ 2 слова українською
 - Найточніший і найуживаніший переклад
 - НЕ описовий (не "той що робить X"), а пряме слово
+- ЯКЩО слово багатозначне — бери НАЙЧАСТІШЕ ВЖИВАНЕ значення в повсякденній мові.
+  Напр.: waste -> "марнувати" (найчастіше дієслово), а не "відходи";
+  book -> "книга"; run -> "бігти". Якщо два значення майже однаково часті —
+  можна дати обидва через кому ("марнувати, відходи").
 - КРИТИЧНО: переклад має точно відповідати ОСНОВНОМУ значенню слова "{word}",
   а не близькому синоніму чи асоціації. Наприклад: committed -> "відданий" (НЕ "привілейований"),
   intent -> "намір" (НЕ "мета", НЕ "привід"). Перевір себе: якщо перекласти твій варіант
@@ -306,6 +393,7 @@ async def generate_cefr_word(cefr_level: str, exclude_words: list) -> dict:
   а не близькому синоніму чи асоціації. Наприклад: committed -> "відданий" (НЕ "привілейований"),
   intent -> "намір" (НЕ "мета", НЕ "привід"). Перевір себе: якщо перекласти твій варіант
   назад на англійську, чи вийде саме це слово чи його точний синонім?
+- Якщо слово багатозначне — бери НАЙЧАСТІШЕ ВЖИВАНЕ значення (waste -> "марнувати", не "відходи").
 
 Правила distractors:
 - РІВНО 8 пар, рівня {cefr_level}, реально вживані (не примітивні, не технічні), правдоподібні

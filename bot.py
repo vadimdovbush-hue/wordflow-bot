@@ -20,7 +20,8 @@ from database import (
 )
 from claude_api import (
     get_word_info, generate_cefr_word, FALLBACK_DISTRACTORS,
-    _validate_distractors, _fill_replacements, regenerate_distractors
+    _validate_distractors, _fill_replacements, regenerate_distractors,
+    get_word_info_fixed
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -678,6 +679,50 @@ async def cmd_fixdistractors(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f'Слів перевірено: {checked}\n'
         f'Регенеровано наборів: {fixed} з {len(all_words)}'
     )
+
+
+async def cmd_setword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручне перевизначення значення слова (для багатозначних слів).
+    Формат:  /setword waste = марнувати, витрачати
+    Бот згенерує під це значення нову транскрипцію, приклади та дистрактори,
+    оновить слово і скине його статистику.
+    """
+    user_id = update.effective_user.id
+    raw = update.message.text or ''
+    # прибираємо саму команду
+    body = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ''
+    if '=' not in body:
+        await update.message.reply_text(
+            'Формат:\n<code>/setword waste = марнувати, витрачати</code>',
+            parse_mode=ParseMode.HTML)
+        return
+
+    word_part, translation = body.split('=', 1)
+    word = word_part.strip().lower()
+    translation = translation.strip()
+    if not word or not translation:
+        await update.message.reply_text(
+            'Формат:\n<code>/setword waste = марнувати, витрачати</code>',
+            parse_mode=ParseMode.HTML)
+        return
+
+    status = await update.message.reply_text(
+        f'⏳ Перегенеровую «{word}» зі значенням «{translation}»...')
+    wd = await get_word_info_fixed(word, translation)
+    rows = db.update_word_content(user_id, word, wd)
+
+    if rows == 0:
+        await status.edit_text(
+            f'😕 Слова «{word}» немає у твоєму списку. '
+            f'Спочатку додай його через ➕ Додати.')
+        return
+
+    lines = [f'✅ Оновлено «{word.upper()}» ({rows} зап.):', DIV,
+             f'<b>{word.upper()}</b> — {wd["translation"]} · 🔊 {wd["transcription"]}',
+             f'▸ <i>{wd["example1"]}</i>',
+             f'▸ <i>{wd["example2"]}</i>', '',
+             'Статистику цього слова скинуто (вчиш нове значення з нуля).']
+    await status.edit_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
 # ============ ADD WORDS ============
@@ -1835,6 +1880,7 @@ def main():
     app.add_handler(CommandHandler('help', cmd_help))
     app.add_handler(CommandHandler('instruction', cmd_help))
     app.add_handler(CommandHandler('fixdistractors', cmd_fixdistractors))
+    app.add_handler(CommandHandler('setword', cmd_setword))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 

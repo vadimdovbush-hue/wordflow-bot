@@ -644,3 +644,19 @@ class Database:
                 (json.dumps(distractors_en, ensure_ascii=False),
                  json.dumps(distractors_uk, ensure_ascii=False), word_id)
             )
+
+    def update_word_content(self, user_id, word_text, wd):
+        """Перевизначає переклад/транскрипцію/приклади/дистрактори для слова (за текстом).
+        Скидає статистику відповідей (значення фактично нове). Повертає к-сть оновлених рядків."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                'UPDATE words SET translation=?, transcription=?, example1=?, example2=?, '
+                'distractors_en=?, distractors_uk=?, correct_answers=0, total_answers=0, '
+                'last_wrong=NULL '
+                'WHERE user_id=? AND lower(word)=lower(?)',
+                (wd['translation'], wd['transcription'], wd['example1'], wd['example2'],
+                 json.dumps(wd.get('distractors_en', []), ensure_ascii=False),
+                 json.dumps(wd.get('distractors_uk', []), ensure_ascii=False),
+                 user_id, word_text)
+            )
+            return cur.rowcount
