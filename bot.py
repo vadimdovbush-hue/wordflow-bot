@@ -18,7 +18,10 @@ from telegram.ext import (
 from database import (
     Database, _now, CEFR_LEVELS, CEFR_TARGET, CEFR_ADVANCE_AT, DAILY_HINTS
 )
-from claude_api import get_word_info, generate_cefr_word, FALLBACK_DISTRACTORS
+from claude_api import (
+    get_word_info, generate_cefr_word, FALLBACK_DISTRACTORS,
+    _validate_distractors, _fill_replacements
+)
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -629,6 +632,42 @@ def help_text():
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text(), parse_mode=ParseMode.HTML,
                                      reply_markup=back_kb())
+
+
+# ============ ADMIN: ONE-TIME DISTRACTOR REVALIDATION ============
+async def cmd_fixdistractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Одноразова перевалідація дистракторів усіх слів у базі (видали команду після використання)."""
+    msg = await update.message.reply_text('⏳ Перевіряю дистрактори у базі...')
+    all_words = db.get_all_words_full()
+    cache = {}
+    checked = 0
+    fixed = 0
+    for w in all_words:
+        d_en = w.get('distractors_en') or []
+        d_uk = w.get('distractors_uk') or []
+        if not d_en or not d_uk or len(d_en) != len(d_uk):
+            continue
+        distractors = [{'en': en, 'uk': uk} for en, uk in zip(d_en, d_uk)]
+        key = (w['word'].strip().lower(), w['translation'], tuple(d_en))
+        if key in cache:
+            bad_flags = cache[key]
+        else:
+            bad_flags = await _validate_distractors(w['word'], w['translation'], distractors)
+            cache[key] = bad_flags
+            checked += 1
+            await asyncio.sleep(0.5)
+        if any(bad_flags):
+            seen = {_norm(d['en']) for d in distractors}
+            seen.add(_norm(w['word']))
+            clean = _fill_replacements(distractors, seen, w['word'].strip().lower(), bad_flags)
+            db.update_word_distractors(w['id'], [d['en'] for d in clean], [d['uk'] for d in clean])
+            fixed += 1
+
+    await msg.edit_text(
+        f'✅ Готово!\n'
+        f'Унікальних наборів перевірено: {checked}\n'
+        f'Виправлено записів: {fixed} з {len(all_words)}'
+    )
 
 
 # ============ ADD WORDS ============
@@ -1738,6 +1777,7 @@ def main():
     app.add_handler(CommandHandler('test', cmd_menu))
     app.add_handler(CommandHandler('help', cmd_help))
     app.add_handler(CommandHandler('instruction', cmd_help))
+    app.add_handler(CommandHandler('fixdistractors', cmd_fixdistractors))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 

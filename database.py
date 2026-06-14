@@ -615,3 +615,18 @@ class Database:
     def clear_quiz(self, user_id):
         with self._conn() as conn:
             conn.execute('DELETE FROM quiz_session WHERE user_id=?', (user_id,))
+
+    # ---------------- ADMIN / MAINTENANCE ----------------
+    def get_all_words_full(self):
+        """Всі слова всіх юзерів (для адмін-операцій типу перевалідації дистракторів)."""
+        with self._conn() as conn:
+            rows = conn.execute('SELECT * FROM words ORDER BY id').fetchall()
+            return [self._row_to_word(r) for r in rows]
+
+    def update_word_distractors(self, word_id, distractors_en, distractors_uk):
+        with self._conn() as conn:
+            conn.execute(
+                'UPDATE words SET distractors_en=?, distractors_uk=? WHERE id=?',
+                (json.dumps(distractors_en, ensure_ascii=False),
+                 json.dumps(distractors_uk, ensure_ascii=False), word_id)
+            )
