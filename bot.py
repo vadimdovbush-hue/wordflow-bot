@@ -20,7 +20,7 @@ from database import (
 )
 from claude_api import (
     get_word_info, generate_cefr_word, FALLBACK_DISTRACTORS,
-    _validate_distractors, _fill_replacements
+    _validate_distractors, _fill_replacements, regenerate_distractors
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -638,11 +638,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_fixdistractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Одноразова перевалідація дистракторів обох напрямків (видали команду після використання).
 
-    Перевіряє ОБИДВІ сторони:
-    - distractors_uk: чи якийсь укр-варіант є прийнятним перекладом самого word
-      (напр. waste -> "залишок"/"надлишок" — синоніми, треба замінити)
-    - distractors_en: чи якесь англ-слово є прийнятним перекладом translation
-    Замість поганих підставляє запасні з FALLBACK_DISTRACTORS.
+    Для кожного слова перевіряє обидві сторони (uk і en). Якщо знаходить дистрактори,
+    близькі за значенням/темою до правильної відповіді — РЕГЕНЕРУЄ весь набір з інших тем.
     """
     msg = await update.message.reply_text('⏳ Перевіряю дистрактори (обидва напрямки)...')
     all_words = db.get_all_words_full()
@@ -657,36 +654,29 @@ async def cmd_fixdistractors(update: Update, context: ContextTypes.DEFAULT_TYPE)
         distractors = [{'en': en, 'uk': uk} for en, uk in zip(d_en, d_uk)]
         word = w['word'].strip().lower()
         translation = w['translation']
-        changed = False
 
-        # 1) UK-сторона: чи uk-варіант = прийнятний переклад слова word
-        #    (питання en2uk: показуємо WORD, обираємо укр. переклад)
+        # 1) UK-сторона: чи uk-варіант близький до перекладу слова (питання en2uk)
         uk_pairs = [{'en': d['uk'], 'uk': d['uk']} for d in distractors]
         bad_uk = await _validate_distractors(word, translation, uk_pairs)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
 
-        # 2) EN-сторона: чи en-варіант = прийнятний переклад translation
-        #    (питання ua2en: показуємо переклад, обираємо англ. слово)
+        # 2) EN-сторона: чи en-варіант близький до значення слова (питання ua2en)
         bad_en = await _validate_distractors(translation, word, distractors)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
         checked += 1
 
-        bad_any = [bool(a or b) for a, b in zip(bad_uk, bad_en)]
-        if any(bad_any):
-            seen = set()
-            for d in distractors:
-                seen.add(_norm(d['en']))
-                seen.add(_norm(d['uk']))
-            seen.add(_norm(word))
-            seen.add(_norm(translation))
-            clean = _fill_replacements(distractors, seen, word, bad_any)
-            db.update_word_distractors(w['id'], [d['en'] for d in clean], [d['uk'] for d in clean])
-            fixed += 1
+        if any(a or b for a, b in zip(bad_uk, bad_en)):
+            fresh = await regenerate_distractors(w['word'], translation)
+            await asyncio.sleep(0.4)
+            if fresh:
+                db.update_word_distractors(
+                    w['id'], fresh['distractors_en'], fresh['distractors_uk'])
+                fixed += 1
 
     await msg.edit_text(
         f'✅ Готово!\n'
         f'Слів перевірено: {checked}\n'
-        f'Виправлено записів: {fixed} з {len(all_words)}'
+        f'Регенеровано наборів: {fixed} з {len(all_words)}'
     )
 
 
