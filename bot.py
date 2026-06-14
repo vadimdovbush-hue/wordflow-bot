@@ -636,36 +636,56 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ ADMIN: ONE-TIME DISTRACTOR REVALIDATION ============
 async def cmd_fixdistractors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Одноразова перевалідація дистракторів усіх слів у базі (видали команду після використання)."""
-    msg = await update.message.reply_text('⏳ Перевіряю дистрактори у базі...')
+    """Одноразова перевалідація дистракторів обох напрямків (видали команду після використання).
+
+    Перевіряє ОБИДВІ сторони:
+    - distractors_uk: чи якийсь укр-варіант є прийнятним перекладом самого word
+      (напр. waste -> "залишок"/"надлишок" — синоніми, треба замінити)
+    - distractors_en: чи якесь англ-слово є прийнятним перекладом translation
+    Замість поганих підставляє запасні з FALLBACK_DISTRACTORS.
+    """
+    msg = await update.message.reply_text('⏳ Перевіряю дистрактори (обидва напрямки)...')
     all_words = db.get_all_words_full()
-    cache = {}
     checked = 0
     fixed = 0
     for w in all_words:
-        d_en = w.get('distractors_en') or []
-        d_uk = w.get('distractors_uk') or []
+        d_en = list(w.get('distractors_en') or [])
+        d_uk = list(w.get('distractors_uk') or [])
         if not d_en or not d_uk or len(d_en) != len(d_uk):
             continue
+
         distractors = [{'en': en, 'uk': uk} for en, uk in zip(d_en, d_uk)]
-        key = (w['word'].strip().lower(), w['translation'], tuple(d_en))
-        if key in cache:
-            bad_flags = cache[key]
-        else:
-            bad_flags = await _validate_distractors(w['word'], w['translation'], distractors)
-            cache[key] = bad_flags
-            checked += 1
-            await asyncio.sleep(0.5)
-        if any(bad_flags):
-            seen = {_norm(d['en']) for d in distractors}
-            seen.add(_norm(w['word']))
-            clean = _fill_replacements(distractors, seen, w['word'].strip().lower(), bad_flags)
+        word = w['word'].strip().lower()
+        translation = w['translation']
+        changed = False
+
+        # 1) UK-сторона: чи uk-варіант = прийнятний переклад слова word
+        #    (питання en2uk: показуємо WORD, обираємо укр. переклад)
+        uk_pairs = [{'en': d['uk'], 'uk': d['uk']} for d in distractors]
+        bad_uk = await _validate_distractors(word, translation, uk_pairs)
+        await asyncio.sleep(0.5)
+
+        # 2) EN-сторона: чи en-варіант = прийнятний переклад translation
+        #    (питання ua2en: показуємо переклад, обираємо англ. слово)
+        bad_en = await _validate_distractors(translation, word, distractors)
+        await asyncio.sleep(0.5)
+        checked += 1
+
+        bad_any = [bool(a or b) for a, b in zip(bad_uk, bad_en)]
+        if any(bad_any):
+            seen = set()
+            for d in distractors:
+                seen.add(_norm(d['en']))
+                seen.add(_norm(d['uk']))
+            seen.add(_norm(word))
+            seen.add(_norm(translation))
+            clean = _fill_replacements(distractors, seen, word, bad_any)
             db.update_word_distractors(w['id'], [d['en'] for d in clean], [d['uk'] for d in clean])
             fixed += 1
 
     await msg.edit_text(
         f'✅ Готово!\n'
-        f'Унікальних наборів перевірено: {checked}\n'
+        f'Слів перевірено: {checked}\n'
         f'Виправлено записів: {fixed} з {len(all_words)}'
     )
 
