@@ -1061,19 +1061,23 @@ async def present_question(user_id, context, chat_id):
 
 
 def _choice_feedback(payload, w, correct, chosen_text):
-    """Короткий рядок-фідбек для choice/gap_choice (1 повідомлення, редагується на місці)."""
+    """Рядок-фідбек для choice/gap_choice (1 повідомлення, редагується на місці)."""
     if payload.get('mode') == 'gap_choice':
         if correct:
-            return (f'✅ Правильно!  <b>{w["word"].upper()}</b> '
-                    f'{w["translation"]} · 🔊 {w["transcription"]}')
+            return (f'✅ Правильно!\n'
+                    f'<b>{w["word"].upper()}</b> {w["translation"]} · 🔊 {w["transcription"]}\n'
+                    f'▸ <i>{w["example1"]}</i>')
         return (f'❌ Не вгадав. Ти обрав: <s>{chosen_text}</s>\n'
-                f'✅ <b>{w["word"].upper()}</b> — {w["translation"]} · 🔊 {w["transcription"]}')
+                f'✅ <b>{w["word"].upper()}</b> — {w["translation"]} · 🔊 {w["transcription"]}\n'
+                f'▸ <i>{w["example1"]}</i>')
     # звичайний choice
     if correct:
-        return (f'✅ Правильно!  <b>{w["word"].upper()}</b> '
-                f'{w["translation"]} · 🔊 {w["transcription"]}')
+        return (f'✅ Правильно!\n'
+                f'<b>{w["word"].upper()}</b> {w["translation"]} · 🔊 {w["transcription"]}\n'
+                f'▸ <i>{w["example1"]}</i>')
     return (f'❌ Не вгадав. Ти обрав: <s>{chosen_text}</s>\n'
-            f'✅ <b>{w["word"].upper()}</b> — {w["translation"]} · 🔊 {w["transcription"]}')
+            f'✅ <b>{w["word"].upper()}</b> — {w["translation"]} · 🔊 {w["transcription"]}\n'
+            f'▸ <i>{w["example1"]}</i>')
 
 
 async def handle_choice_answer(user_id, selected, context, chat_id, query):
