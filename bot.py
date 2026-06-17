@@ -1392,15 +1392,23 @@ async def finish_quiz(user_id, context, chat_id):
                                                reply_markup=kb)
         else:
             db.set_official_cooldown(user_id, 10)
+            # Зберігаємо слова з помилками для нагадування через 10 хв
+            wrong_ids = list(seen_wrong)
+            context.job_queue.run_once(
+                _exam_retry_reminder,
+                when=600,  # 10 хвилин
+                data={'user_id': user_id, 'chat_id': chat_id, 'wrong_ids': wrong_ids},
+                name=f'exam_retry_{user_id}'
+            )
             msg = (f'😅 <b>{correct}/{total}</b>\n{DIV}\n'
                    f'Майже! Помилки в: {", ".join(wrong_words)}\n\n'
-                   f'⏳ Спробуй знову через 10 хвилин.')
+                   f'⏳ Через 10 хвилин надішлю нагадування.')
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('🔄 Спробувати знову', callback_data='test:official')],
                 [InlineKeyboardButton('◀️ Меню', callback_data='m:home')],
             ])
             await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML, reply_markup=kb)
     elif kind == 'gap':
+        db.record_training_done(user_id)
         pct = round(correct / total * 100) if total else 0
         msg = f'✏️ <b>Речення з пропуском — завершено</b>\n{DIV}\n✅ {correct}/{total} ({pct}%)\n'
         if wrong_words:
@@ -1410,12 +1418,19 @@ async def finish_quiz(user_id, context, chat_id):
         await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
                                        reply_markup=main_menu_kb(user_id))
     else:
+        db.record_training_done(user_id)
         pct = round(correct / total * 100) if total else 0
+        done = db.get_trainings_done(user_id)
+        needed = db.trainings_needed(user_id)
         msg = f'🎯 <b>Тренування завершено</b>\n{DIV}\n✅ {correct}/{total} ({pct}%)\n'
         if wrong_words:
-            msg += f'😅 Повтори: {", ".join(wrong_words)}'
+            msg += f'😅 Повтори: {", ".join(wrong_words)}\n'
         else:
-            msg += '🔥 Жодної помилки!'
+            msg += '🔥 Жодної помилки!\n'
+        if needed > 0:
+            msg += f'\n📊 Тренувань сьогодні: {done}/{db.REQUIRED_TRAININGS} · ще {needed} до екзамену'
+        else:
+            msg += f'\n✅ Всі тренування пройдено — екзамен о 21:00 відкрито!'
         await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML,
                                        reply_markup=main_menu_kb(user_id))
 
@@ -1622,6 +1637,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query,
                 f'⏰ Офіційний тест доступний лише з <b>21:00 до 00:00</b> за Хошиміном.\n\n'
                 f'Зараз {_now().strftime("%H:%M")}. Поки що тренуйся 🎯',
+                back_kb('m:test')
+            )
+        # Перевірка чи пройдені всі тренування
+        needed = db.trainings_needed(user_id)
+        if needed > 0:
+            done = db.get_trainings_done(user_id)
+            return await safe_edit(
+                query,
+                f'🔒 <b>Офіційний тест розпочато</b>\n{DIV}\n'
+                f'Але потрібно пройти ще <b>{needed}</b> тренування щоб відкрити екзамен.\n\n'
+                f'📊 Пройдено сьогодні: {done}/{db.REQUIRED_TRAININGS}\n'
+                f'Тренування: 10:30 · 12:00 · 14:30 · 18:00',
                 back_kb('m:test')
             )
         rem = db.official_cooldown_remaining(user_id)
@@ -1861,17 +1888,54 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 await start_quiz_words(uid, 'gap', gap_words, context, uid)
 
             elif kind == 'official':
-                await context.bot.send_message(
-                    uid,
-                    f'🏆 <b>Час офіційного тесту!</b>\n{DIV}\n'
-                    f'Здай на 100% до 00:00 — і відкриється нова партія.',
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton('🏆 Почати тест', callback_data='test:official')]
-                    ])
-                )
+                needed = db.trainings_needed(uid)
+                done = db.get_trainings_done(uid)
+                if needed > 0:
+                    await context.bot.send_message(
+                        uid,
+                        f'🏆 <b>Час офіційного тесту!</b>\n{DIV}\n'
+                        f'🔒 Але ти пройшов лише {done}/{db.REQUIRED_TRAININGS} тренувань сьогодні.\n'
+                        f'Потрібно ще <b>{needed}</b> тренування для доступу до екзамену.\n\n'
+                        f'Тренування: 10:30 · 12:00 · 14:30 · 18:00',
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await context.bot.send_message(
+                        uid,
+                        f'🏆 <b>Час офіційного тесту!</b>\n{DIV}\n'
+                        f'Здай на 100% до 00:00 — і відкриється нова партія.',
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton('🏆 Почати тест', callback_data='test:official')]
+                        ])
+                    )
         except Exception as e:
             logger.error(f'reminder {kind} for {uid}: {e}')
+
+
+async def _exam_retry_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Нагадування через 10 хв після провалу екзамену зі словами де була помилка."""
+    data = context.job.data
+    user_id = data['user_id']
+    chat_id = data['chat_id']
+    wrong_ids = data.get('wrong_ids', [])
+
+    lines = ['⏰ <b>Час спробувати ще раз!</b>', DIV]
+    if wrong_ids:
+        lines.append('Нагадую слова де була помилка:')
+        for wid in wrong_ids:
+            w = db.get_word_by_id(user_id, int(wid))
+            if w:
+                lines.append(f'• <b>{w["word"].upper()}</b> — {w["translation"]} · 🔊 {w["transcription"]}')
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton('🏆 Почати екзамен', callback_data='test:official')]
+    ])
+    try:
+        await context.bot.send_message(chat_id, '\n'.join(lines),
+                                       parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        logger.error(f'exam_retry_reminder error for {user_id}: {e}')
 
 
 async def post_init(application: Application):

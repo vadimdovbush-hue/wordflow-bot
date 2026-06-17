@@ -121,6 +121,10 @@ class Database:
                 conn.execute('ALTER TABLE users ADD COLUMN hints_date TEXT')
             if 'hints_used' not in ucols:
                 conn.execute('ALTER TABLE users ADD COLUMN hints_used INTEGER DEFAULT 0')
+            if 'trainings_date' not in ucols:
+                conn.execute('ALTER TABLE users ADD COLUMN trainings_date TEXT')
+            if 'trainings_done' not in ucols:
+                conn.execute('ALTER TABLE users ADD COLUMN trainings_done INTEGER DEFAULT 0')
 
             wcols = cols('words')
             if 'distractors_en' not in wcols:
@@ -629,6 +633,47 @@ class Database:
     def clear_quiz(self, user_id):
         with self._conn() as conn:
             conn.execute('DELETE FROM quiz_session WHERE user_id=?', (user_id,))
+
+    # ---------------- TRAINING COUNTER ----------------
+    REQUIRED_TRAININGS = 4  # скільки тренувань треба завершити для доступу до екзамену
+
+    def get_trainings_done(self, user_id):
+        """Скільки тренувань завершено сьогодні."""
+        u = self.get_user(user_id)
+        if not u:
+            return 0
+        today = _today()
+        if u.get('trainings_date') != today:
+            return 0
+        return u.get('trainings_done') or 0
+
+    def record_training_done(self, user_id):
+        """Зарахувати одне завершене тренування сьогодні."""
+        today = _today()
+        with self._conn() as conn:
+            u = conn.execute(
+                'SELECT trainings_date, trainings_done FROM users WHERE user_id=?',
+                (user_id,)
+            ).fetchone()
+            if not u or u['trainings_date'] != today:
+                conn.execute(
+                    'UPDATE users SET trainings_date=?, trainings_done=1 WHERE user_id=?',
+                    (today, user_id)
+                )
+            else:
+                done = (u['trainings_done'] or 0) + 1
+                conn.execute(
+                    'UPDATE users SET trainings_done=? WHERE user_id=?',
+                    (min(done, self.REQUIRED_TRAININGS), user_id)
+                )
+
+    def can_take_exam(self, user_id):
+        """Чи є доступ до офіційного тесту (завершено всі REQUIRED_TRAININGS сьогодні)."""
+        return self.get_trainings_done(user_id) >= self.REQUIRED_TRAININGS
+
+    def trainings_needed(self, user_id):
+        """Скільки ще тренувань треба до екзамену."""
+        return max(0, self.REQUIRED_TRAININGS - self.get_trainings_done(user_id))
 
     # ---------------- ADMIN / MAINTENANCE ----------------
     def get_all_words_full(self):
