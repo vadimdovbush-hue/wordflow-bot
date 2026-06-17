@@ -831,13 +831,55 @@ def _make_gap(sentence, word):
     return result
 
 
-def build_question(user_id, w, level, gap=False, forced_direction=None):
+def _pick_distractors(correct, need, pool_own, pool_random, seen):
+    """Мікс дистракторів: від 30% до 70% з власної партії, решта рандомні.
+    correct, pool_own, pool_random — вже нормалізовані (lowercase stripped).
+    seen — множина вже використаних значень (включно з correct).
+    Повертає список рядків довжиною need."""
+    if need <= 0:
+        return []
+
+    # скільки з партії (30-70% від need, мін 0 мін 1 якщо є звідки брати)
+    from_own_max = max(1, round(need * 0.70))
+    from_own_min = max(0, round(need * 0.30))
+    from_own_count = random.randint(from_own_min, from_own_max)
+
+    avail_own = [d for d in pool_own if _norm(d) not in seen]
+    random.shuffle(avail_own)
+    own_chosen = avail_own[:from_own_count]
+    for d in own_chosen:
+        seen.add(_norm(d))
+
+    # решта — з рандомного пулу
+    rest_count = need - len(own_chosen)
+    avail_rand = [d for d in pool_random if _norm(d) not in seen]
+    random.shuffle(avail_rand)
+    rand_chosen = avail_rand[:rest_count]
+    for d in rand_chosen:
+        seen.add(_norm(d))
+
+    chosen = own_chosen + rand_chosen
+    random.shuffle(chosen)
+
+    # якщо все одно не вистачає — добиваємо рандомом
+    if len(chosen) < need:
+        fb = [d['en'] for d in FALLBACK_DISTRACTORS if _norm(d['en']) not in seen]
+        random.shuffle(fb)
+        for d in fb:
+            chosen.append(d)
+            seen.add(_norm(d))
+            if len(chosen) >= need:
+                break
+
+    return chosen[:need]
+
+
+def build_question(user_id, w, level, gap=False, forced_direction=None, batch_words=None):
+    """batch_words — список усіх слів активної партії (для 30-70% дистракторів з партії)."""
     conf = LEVELS[level]
     payload = {'word_id': w['id']}
 
     if gap:
-        # Gap-режим: вгадуємо слово за реченням з пропуском,
-        # без транскрипції, кнопки за рівнем складності
         sentence = w.get('example1') or w.get('example2') or w['word']
         gapped = _make_gap(sentence, w['word'])
         payload['sentence'] = gapped
@@ -848,27 +890,18 @@ def build_question(user_id, w, level, gap=False, forced_direction=None):
 
         nbtn = conf['buttons']
         correct = w['word']
-        pool = list(w.get('distractors_en', []) or [])
-        fallback = [d['en'] for d in FALLBACK_DISTRACTORS]
-
         seen = {_norm(correct)}
-        uniq = []
-        for d in pool:
-            if _norm(d) and _norm(d) not in seen:
-                seen.add(_norm(d))
-                uniq.append(d)
-        random.shuffle(uniq)
 
-        need = nbtn - 1
-        chosen = uniq[:need]
-        if len(chosen) < need:
-            fb = [d for d in fallback if _norm(d) not in seen]
-            random.shuffle(fb)
-            for d in fb:
-                chosen.append(d)
-                seen.add(_norm(d))
-                if len(chosen) >= need:
-                    break
+        # пул з партії (en-слова інших слів, крім поточного)
+        pool_own = []
+        if batch_words:
+            for bw in batch_words:
+                if bw['id'] != w['id']:
+                    pool_own.append(bw['word'])
+
+        pool_random = list(w.get('distractors_en', []) or [])
+
+        chosen = _pick_distractors(correct, nbtn - 1, pool_own, pool_random, seen)
 
         options = chosen + [correct]
         random.shuffle(options)
@@ -887,35 +920,29 @@ def build_question(user_id, w, level, gap=False, forced_direction=None):
     nbtn = conf['buttons']
     if direction == 'ua2en':
         correct = w['word']
-        pool = list(w.get('distractors_en', []) or [])
-        fallback = [d['en'] for d in FALLBACK_DISTRACTORS]
+        pool_random = list(w.get('distractors_en', []) or [])
+        # пул з партії — en-слова інших слів
+        pool_own = []
+        if batch_words:
+            for bw in batch_words:
+                if bw['id'] != w['id']:
+                    pool_own.append(bw['word'])
         prompt = w['translation']
         flag = '🇺🇦'
     else:
         correct = w['translation']
-        pool = list(w.get('distractors_uk', []) or [])
-        fallback = [d['uk'] for d in FALLBACK_DISTRACTORS]
+        pool_random = list(w.get('distractors_uk', []) or [])
+        # пул з партії — uk-переклади інших слів
+        pool_own = []
+        if batch_words:
+            for bw in batch_words:
+                if bw['id'] != w['id']:
+                    pool_own.append(bw['translation'])
         prompt = w['word']
         flag = '🇬🇧'
 
     seen = {_norm(correct)}
-    uniq = []
-    for d in pool:
-        if _norm(d) and _norm(d) not in seen:
-            seen.add(_norm(d))
-            uniq.append(d)
-    random.shuffle(uniq)
-
-    need = nbtn - 1
-    chosen = uniq[:need]
-    if len(chosen) < need:
-        fb = [d for d in fallback if _norm(d) not in seen]
-        random.shuffle(fb)
-        for d in fb:
-            chosen.append(d)
-            seen.add(_norm(d))
-            if len(chosen) >= need:
-                break
+    chosen = _pick_distractors(correct, nbtn - 1, pool_own, pool_random, seen)
 
     options = chosen + [correct]
     random.shuffle(options)
@@ -1021,7 +1048,9 @@ async def present_question(user_id, context, chat_id):
     q = db.get_quiz(user_id)
     lvl = db.get_level(user_id) or 3
     gap = (q is not None and q['kind'] == 'gap')
-    payload = build_question(user_id, w, lvl, gap=gap, forced_direction=forced_dir)
+    batch_words = db.get_active_batch_words(user_id)
+    payload = build_question(user_id, w, lvl, gap=gap, forced_direction=forced_dir,
+                             batch_words=batch_words)
     db.set_current_question(user_id, payload)
 
     q = db.get_quiz(user_id)
@@ -1127,7 +1156,9 @@ async def handle_choice_answer(user_id, selected, context, chat_id, query):
 
     lvl = db.get_level(user_id) or 3
     gap = (q['kind'] == 'gap')
-    payload2 = build_question(user_id, w2, lvl, gap=gap, forced_direction=forced_dir)
+    batch_words = db.get_active_batch_words(user_id)
+    payload2 = build_question(user_id, w2, lvl, gap=gap, forced_direction=forced_dir,
+                              batch_words=batch_words)
     db.set_current_question(user_id, payload2)
 
     q2 = db.get_quiz(user_id)
